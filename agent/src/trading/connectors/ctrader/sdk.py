@@ -1,0 +1,729 @@
+"""cTrader Open API connector.
+
+Cross-platform (Linux, ChromeOS, macOS, Windows) — communicates with
+cTrader's Open API over TCP using the ``ctrader-open-api`` package.
+
+The cTrader Open API uses Twisted under the hood. To keep all public
+functions synchronous (matching the broker_sdk contract), a single
+Twisted reactor runs in a dedicated daemon thread started on first use.
+Each API call dispatches work onto that thread via ``reactor.callFromThread``
+and blocks the calling thread with a ``queue.Queue`` until the response
+arrives or the timeout expires.
+
+Install:  pip install ctrader-open-api
+
+Credentials: ~/.vibe-trading/ctrader.json
+    {
+        "client_id":     "your_app_client_id",
+        "client_secret": "your_app_client_secret",
+        "access_token":  "your_account_access_token",
+        "account_id":    12345678,
+        "environment":   "demo"
+    }
+
+Getting credentials
+-------------------
+1. Register a free Open API app at https://connect.ctrader.com
+   → copy client_id and client_secret.
+2. Authorise your cTrader account via OAuth2 to obtain an access_token.
+   The quickest way: cTrader Desktop → Settings → API → Generate token.
+3. account_id: cTrader Desktop → Settings → Account info.
+
+Supported environments: "demo" (paper trading) or "live".
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import queue as _queue
+import threading
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+from src.config.paths import get_runtime_root
+
+logger = logging.getLogger(__name__)
+
+CONFIG_FILENAME = "ctrader.json"
+
+PROFILE_ENVIRONMENTS = {
+    "demo": "paper",
+    "live": "live",
+}
+
+
+class CTraderDependencyError(RuntimeError):
+    """Raised when ``ctrader-open-api`` is not installed."""
+
+
+class CTraderConfigError(RuntimeError):
+    """Raised when credentials are missing or invalid."""
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CTraderConfig:
+    """cTrader connector credentials and settings.
+
+    Attributes:
+        client_id: Open API application client id (from connect.ctrader.com).
+        client_secret: Open API application client secret.
+        access_token: OAuth2 access token for the specific cTrader account.
+        account_id: Numeric cTrader account id.
+        environment: ``"demo"`` or ``"live"``.
+        timeout: Per-request timeout in seconds.
+    """
+
+    client_id: str = ""
+    client_secret: str = ""
+    access_token: str = ""
+    account_id: int = 0
+    environment: str = "demo"
+    timeout: int = 30
+
+
+def _config_path() -> Path:
+    return get_runtime_root() / CONFIG_FILENAME
+
+
+def load_config() -> CTraderConfig:
+    path = _config_path()
+    if not path.exists():
+        raise CTraderConfigError(
+            f"cTrader config not found at {path}. "
+            "Create ~/.vibe-trading/ctrader.json with client_id, client_secret, "
+            "access_token, account_id, and environment."
+        )
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return CTraderConfig(**{k: v for k, v in raw.items() if k in CTraderConfig.__dataclass_fields__})
+    except Exception as exc:
+        raise CTraderConfigError(f"Could not parse ctrader.json: {exc}") from exc
+
+
+def save_config(config: CTraderConfig) -> Path:
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+    return path
+
+
+def build_config(profile_config: Mapping[str, Any], overrides: Mapping[str, Any] | None = None) -> CTraderConfig:
+    stored = load_config()
+    merged = {**asdict(stored), **(profile_config or {}), **(overrides or {})}
+    return CTraderConfig(**{k: v for k, v in merged.items() if k in CTraderConfig.__dataclass_fields__})
+
+
+# ---------------------------------------------------------------------------
+# Twisted reactor management
+# ---------------------------------------------------------------------------
+
+_reactor_lock = threading.Lock()
+_reactor_thread: threading.Thread | None = None
+_reactor_ready = threading.Event()
+
+
+def _ensure_reactor() -> None:
+    """Start the Twisted reactor in a daemon thread (idempotent)."""
+    global _reactor_thread
+    with _reactor_lock:
+        if _reactor_thread is not None and _reactor_thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                from twisted.internet import reactor
+                reactor.callLater(0, _reactor_ready.set)
+                reactor.run(installSignalHandlers=False)
+            except Exception as exc:
+                logger.error("[ctrader] Reactor thread error: %s", exc)
+                _reactor_ready.set()  # unblock callers even on failure
+
+        _reactor_thread = threading.Thread(
+            target=_run,
+            name="ctrader-reactor",
+            daemon=True,
+        )
+        _reactor_thread.start()
+        _reactor_ready.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Core request executor
+# ---------------------------------------------------------------------------
+
+
+def _execute(
+    config: CTraderConfig,
+    make_request,
+    *,
+    timeout: int | None = None,
+) -> Any:
+    """Connect to cTrader, authenticate, execute one request, return result.
+
+    ``make_request(client, put_result)`` is called after successful auth.
+    It should call ``put_result(value)`` with the parsed response or
+    ``put_result(Exception(...))`` on error.
+    """
+    _check_dependency()
+    _ensure_reactor()
+
+    timeout = timeout or config.timeout
+    result_q: _queue.Queue[Any] = _queue.Queue()
+
+    def put_result(value: Any) -> None:
+        result_q.put(value)
+
+    def _start() -> None:
+        try:
+            from ctrader_open_api import Client, TcpProtocol, EndPoints
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOAApplicationAuthReq,
+                ProtoOAAccountAuthReq,
+            )
+
+            host = (
+                EndPoints.PROTOBUF_DEMO_HOST
+                if config.environment == "demo"
+                else EndPoints.PROTOBUF_LIVE_HOST
+            )
+            client_holder: list[Any] = []
+            phase = ["connecting"]
+
+            def on_message(client: Any, message: Any) -> None:
+                try:
+                    _handle_message(
+                        client, message, config, phase, client_holder,
+                        make_request, put_result,
+                    )
+                except Exception as exc:
+                    logger.exception("[ctrader] on_message error")
+                    result_q.put(exc)
+                    _safe_stop(client)
+
+            def on_connected(client: Any) -> None:
+                client_holder.append(client)
+                phase[0] = "app_auth"
+                req = ProtoOAApplicationAuthReq()
+                req.clientId = config.client_id
+                req.clientSecret = config.client_secret
+                client.send(req)
+
+            def on_disconnected(client: Any) -> None:
+                if result_q.empty():
+                    result_q.put(RuntimeError("cTrader disconnected before response"))
+
+            ct_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+            ct_client.setConnectedCallback(on_connected)
+            ct_client.setDisconnectedCallback(on_disconnected)
+            ct_client.setMessageReceivedCallback(on_message)
+            ct_client.startService()
+        except Exception as exc:
+            result_q.put(exc)
+
+    from twisted.internet import reactor
+    reactor.callFromThread(_start)
+
+    try:
+        value = result_q.get(timeout=timeout)
+    except _queue.Empty:
+        raise TimeoutError(f"cTrader API call timed out after {timeout}s")
+
+    if isinstance(value, Exception):
+        raise value
+    return value
+
+
+def _handle_message(
+    client: Any,
+    message: Any,
+    config: CTraderConfig,
+    phase: list[str],
+    client_holder: list[Any],
+    make_request: Any,
+    put_result: Any,
+) -> None:
+    """Route incoming messages based on auth phase."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAAccountAuthReq,
+        ProtoOAApplicationAuthRes,
+        ProtoOAAccountAuthRes,
+        ProtoOAErrorRes,
+    )
+    from ctrader_open_api import Protobuf
+
+    payload_type = message.payloadType
+
+    # Error response — any phase.
+    try:
+        err_type = ProtoOAErrorRes().payloadType
+        if payload_type == err_type:
+            err = ProtoOAErrorRes()
+            err.ParseFromString(message.payload)
+            exc = RuntimeError(f"cTrader error {err.errorCode}: {err.description}")
+            put_result(exc)
+            _safe_stop(client)
+            return
+    except Exception:
+        pass
+
+    if phase[0] == "app_auth":
+        try:
+            app_res_type = ProtoOAApplicationAuthRes().payloadType
+        except Exception:
+            app_res_type = None
+
+        if app_res_type is not None and payload_type == app_res_type:
+            phase[0] = "account_auth"
+            req = ProtoOAAccountAuthReq()
+            req.ctidTraderAccountId = config.account_id
+            req.accessToken = config.access_token
+            client.send(req)
+
+    elif phase[0] == "account_auth":
+        try:
+            acc_res_type = ProtoOAAccountAuthRes().payloadType
+        except Exception:
+            acc_res_type = None
+
+        if acc_res_type is not None and payload_type == acc_res_type:
+            phase[0] = "request"
+            make_request(client, message, put_result, _safe_stop)
+
+    elif phase[0] == "request":
+        # Delegate all subsequent messages to the active request handler.
+        if hasattr(make_request, "on_message"):
+            make_request.on_message(client, message, put_result, _safe_stop)
+
+
+def _safe_stop(client: Any) -> None:
+    try:
+        client.stopService()
+    except Exception:
+        pass
+
+
+def _check_dependency() -> None:
+    try:
+        import ctrader_open_api  # noqa: F401
+    except ImportError:
+        raise CTraderDependencyError(
+            "ctrader-open-api is not installed. "
+            "Run: pip install ctrader-open-api"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_trader_request(client: Any, _auth_msg: Any, put_result: Any, stop: Any) -> None:
+    """Request handler for get_account_snapshot."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOATraderReq, ProtoOATraderRes,
+    )
+
+    _res_type = ProtoOATraderRes().payloadType
+
+    def on_message(c: Any, msg: Any, put: Any, stp: Any) -> None:
+        if msg.payloadType == _res_type:
+            res = ProtoOATraderRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stp(c)
+
+    _make_trader_request.on_message = on_message  # type: ignore[attr-defined]
+    req = ProtoOATraderReq()
+    req.ctidTraderAccountId = client._config_account_id if hasattr(client, "_config_account_id") else 0
+    client.send(req)
+
+
+class _RequestHandler:
+    """Base class for cTrader request handlers attached to make_request slot."""
+
+    def __call__(self, client: Any, auth_msg: Any, put_result: Any, stop: Any) -> None:
+        self._client = client
+        self._put = put_result
+        self._stop = stop
+        self._send(client)
+
+    def _send(self, client: Any) -> None:
+        raise NotImplementedError
+
+    def on_message(self, client: Any, msg: Any, put_result: Any, stop: Any) -> None:
+        raise NotImplementedError
+
+
+class _TraderRequest(_RequestHandler):
+    def __init__(self, account_id: int) -> None:
+        self._account_id = account_id
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOATraderReq
+        req = ProtoOATraderReq()
+        req.ctidTraderAccountId = self._account_id
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOATraderRes
+        if msg.payloadType == ProtoOATraderRes().payloadType:
+            res = ProtoOATraderRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+class _ReconcileRequest(_RequestHandler):
+    def __init__(self, account_id: int) -> None:
+        self._account_id = account_id
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAReconcileReq
+        req = ProtoOAReconcileReq()
+        req.ctidTraderAccountId = self._account_id
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAReconcileRes
+        if msg.payloadType == ProtoOAReconcileRes().payloadType:
+            res = ProtoOAReconcileRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+class _SymbolsRequest(_RequestHandler):
+    def __init__(self, account_id: int) -> None:
+        self._account_id = account_id
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolsListReq
+        req = ProtoOASymbolsListReq()
+        req.ctidTraderAccountId = self._account_id
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolsListRes
+        if msg.payloadType == ProtoOASymbolsListRes().payloadType:
+            res = ProtoOASymbolsListRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+class _SpotRequest(_RequestHandler):
+    """Subscribe to spots for one symbol, capture first tick, unsubscribe."""
+
+    def __init__(self, account_id: int, symbol_id: int) -> None:
+        self._account_id = account_id
+        self._symbol_id = symbol_id
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASubscribeSpotsReq
+        req = ProtoOASubscribeSpotsReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId.append(self._symbol_id)
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASpotEvent
+        if msg.payloadType == ProtoOASpotEvent().payloadType:
+            evt = ProtoOASpotEvent()
+            evt.ParseFromString(msg.payload)
+            put(evt)
+            stop(client)
+
+
+class _TrendbarsRequest(_RequestHandler):
+    def __init__(self, account_id: int, symbol_id: int, period: int, count: int) -> None:
+        self._account_id = account_id
+        self._symbol_id = symbol_id
+        self._period = period
+        self._count = count
+
+    def _send(self, client: Any) -> None:
+        import time
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsReq
+        req = ProtoOAGetTrendbarsReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId = self._symbol_id
+        req.period = self._period
+        req.count = self._count
+        req.toTimestamp = int(time.time() * 1000)
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsRes
+        if msg.payloadType == ProtoOAGetTrendbarsRes().payloadType:
+            res = ProtoOAGetTrendbarsRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+class _NewOrderRequest(_RequestHandler):
+    def __init__(self, account_id: int, symbol_id: int, side: int, volume: int) -> None:
+        self._account_id = account_id
+        self._symbol_id = symbol_id
+        self._side = side
+        self._volume = volume
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
+        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOAOrderType
+        req = ProtoOANewOrderReq()
+        req.ctidTraderAccountId = self._account_id
+        req.symbolId = self._symbol_id
+        req.orderType = ProtoOAOrderType.Value("MARKET")
+        req.tradeSide = self._side
+        req.volume = self._volume
+        req.comment = "vibe-trading"
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+        if msg.payloadType == ProtoOAExecutionEvent().payloadType:
+            res = ProtoOAExecutionEvent()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+class _CancelOrderRequest(_RequestHandler):
+    def __init__(self, account_id: int, order_id: int) -> None:
+        self._account_id = account_id
+        self._order_id = order_id
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOACancelOrderReq
+        req = ProtoOACancelOrderReq()
+        req.ctidTraderAccountId = self._account_id
+        req.orderId = self._order_id
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+        if msg.payloadType == ProtoOAExecutionEvent().payloadType:
+            res = ProtoOAExecutionEvent()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
+# ---------------------------------------------------------------------------
+# Symbol cache (avoids repeated symbol list requests)
+# ---------------------------------------------------------------------------
+
+_symbol_cache: dict[str, dict[str, int]] = {}  # env → {name_upper: symbolId}
+_symbol_cache_lock = threading.Lock()
+
+
+def _get_symbol_id(symbol: str, config: CTraderConfig) -> int:
+    """Return the numeric symbolId for *symbol*, using a per-environment cache."""
+    key = config.environment
+    symbol_upper = symbol.strip().upper()
+
+    with _symbol_cache_lock:
+        if key in _symbol_cache and symbol_upper in _symbol_cache[key]:
+            return _symbol_cache[key][symbol_upper]
+
+    res = _execute(config, _SymbolsRequest(config.account_id))
+    mapping: dict[str, int] = {}
+    for sym in res.symbol:
+        name = sym.symbolName.strip().upper()
+        mapping[name] = sym.symbolId
+
+    with _symbol_cache_lock:
+        _symbol_cache[key] = mapping
+        if symbol_upper not in mapping:
+            raise ValueError(
+                f"Symbol '{symbol}' not found on this cTrader account. "
+                f"Available symbols: {', '.join(sorted(mapping)[:20])}..."
+            )
+        return mapping[symbol_upper]
+
+
+# ---------------------------------------------------------------------------
+# Period mapping
+# ---------------------------------------------------------------------------
+
+_PERIOD_MAP = {
+    "1m": "M1", "m1": "M1",
+    "5m": "M5", "m5": "M5",
+    "15m": "M15", "m15": "M15",
+    "30m": "M30", "m30": "M30",
+    "1h": "H1", "h1": "H1",
+    "4h": "H4", "h4": "H4",
+    "1d": "D1", "d1": "D1",
+    "1w": "W1", "w1": "W1",
+    "1mo": "MN1", "mn1": "MN1",
+}
+
+
+def _period_to_ctrader(period: str) -> int:
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOATrendbarPeriod
+    name = _PERIOD_MAP.get(period.lower(), "H1")
+    return ProtoOATrendbarPeriod.Value(name)
+
+
+# ---------------------------------------------------------------------------
+# Public connector functions (broker_sdk contract)
+# ---------------------------------------------------------------------------
+
+
+def check_status(config: CTraderConfig | None = None) -> dict[str, Any]:
+    if config is None:
+        config = load_config()
+    _check_dependency()
+    try:
+        res = _execute(config, _TraderRequest(config.account_id))
+        return {
+            "status": "connected",
+            "environment": config.environment,
+            "account_id": config.account_id,
+            "balance": res.trader.balance / 100.0,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+def get_account_snapshot(config: CTraderConfig) -> dict[str, Any]:
+    res = _execute(config, _TraderRequest(config.account_id))
+    t = res.trader
+    balance = t.balance / 100.0
+    equity = t.equity / 100.0 if t.HasField("equity") else balance
+    used_margin = t.marginUsed / 100.0 if t.HasField("marginUsed") else 0.0
+    return {
+        "account_id": config.account_id,
+        "environment": config.environment,
+        "balance": balance,
+        "equity": equity,
+        "used_margin": used_margin,
+        "free_margin": equity - used_margin,
+        "currency": t.depositAsset.name if t.HasField("depositAsset") else "USD",
+    }
+
+
+def get_positions(config: CTraderConfig) -> dict[str, Any]:
+    res = _execute(config, _ReconcileRequest(config.account_id))
+    positions = []
+    for pos in res.position:
+        side = "buy" if pos.tradeData.tradeSide == 1 else "sell"
+        qty_lots = pos.tradeData.volume / 100000.0
+        positions.append({
+            "symbol": pos.tradeData.symbolId,  # numeric; resolved upstream if needed
+            "quantity": qty_lots if side == "buy" else -qty_lots,
+            "side": side,
+            "entry_price": pos.price / 100000.0 if pos.price else 0,
+            "position_id": pos.positionId,
+        })
+    return {"positions": positions}
+
+
+def get_open_orders(config: CTraderConfig) -> dict[str, Any]:
+    res = _execute(config, _ReconcileRequest(config.account_id))
+    orders = []
+    for order in res.order:
+        orders.append({
+            "order_id": order.orderId,
+            "symbol": order.tradeData.symbolId,
+            "side": "buy" if order.tradeData.tradeSide == 1 else "sell",
+            "quantity": order.tradeData.volume / 100000.0,
+            "order_type": order.orderType,
+            "status": order.orderStatus,
+        })
+    return {"orders": orders}
+
+
+def get_quote(symbol: str, config: CTraderConfig) -> dict[str, Any]:
+    symbol_id = _get_symbol_id(symbol, config)
+    evt = _execute(config, _SpotRequest(config.account_id, symbol_id))
+    bid = evt.bid / 100000.0 if evt.bid else 0.0
+    ask = evt.ask / 100000.0 if evt.ask else 0.0
+    mid = (bid + ask) / 2 if bid and ask else (bid or ask)
+    return {
+        "symbol": symbol,
+        "bid": bid,
+        "ask": ask,
+        "last": mid,
+        "price": mid,
+    }
+
+
+def get_historical_bars(
+    symbol: str,
+    config: CTraderConfig,
+    period: str = "1h",
+    limit: int = 100,
+) -> dict[str, Any]:
+    symbol_id = _get_symbol_id(symbol, config)
+    period_int = _period_to_ctrader(period)
+    res = _execute(config, _TrendbarsRequest(config.account_id, symbol_id, period_int, limit))
+    bars = []
+    for bar in res.trendbar:
+        ts_s = bar.utcTimestampInMinutes * 60
+        low = bar.low / 100000.0
+        delta_open = bar.deltaOpen / 100000.0 if bar.HasField("deltaOpen") else 0.0
+        delta_high = bar.deltaHigh / 100000.0 if bar.HasField("deltaHigh") else 0.0
+        delta_close = bar.deltaClose / 100000.0 if bar.HasField("deltaClose") else 0.0
+        open_p = low + delta_open
+        high_p = low + delta_high
+        close_p = low + delta_close
+        bars.append({
+            "timestamp": ts_s,
+            "open": round(open_p, 5),
+            "high": round(high_p, 5),
+            "low": round(low, 5),
+            "close": round(close_p, 5),
+            "volume": bar.volume,
+        })
+    return {"bars": bars, "symbol": symbol, "period": period}
+
+
+def place_order(
+    symbol: str,
+    config: CTraderConfig,
+    side: str,
+    quantity: float,
+    order_type: str = "market",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOATradeSide
+
+    symbol_id = _get_symbol_id(symbol, config)
+    trade_side = ProtoOATradeSide.Value("BUY" if side.lower() == "buy" else "SELL")
+    # Convert lots to cTrader volume units (1 standard lot = 100,000 units)
+    volume = max(1000, int(round(quantity * 100000)))
+
+    res = _execute(config, _NewOrderRequest(config.account_id, symbol_id, trade_side, volume))
+    return {
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "volume": volume,
+        "execution_type": res.executionType,
+        "order_id": res.order.orderId if res.HasField("order") else None,
+        "position_id": res.position.positionId if res.HasField("position") else None,
+        "status": "placed",
+    }
+
+
+def cancel_order(order_id: str, config: CTraderConfig, **kwargs: Any) -> dict[str, Any]:
+    try:
+        oid = int(order_id)
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid cTrader order_id: {order_id!r} (must be numeric)")
+
+    res = _execute(config, _CancelOrderRequest(config.account_id, oid))
+    return {
+        "order_id": order_id,
+        "status": "cancelled",
+        "execution_type": res.executionType,
+    }

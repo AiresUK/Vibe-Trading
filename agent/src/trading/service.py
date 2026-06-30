@@ -24,6 +24,7 @@ _SDK_CONNECTOR_MODULES = {
     "shoonya": "src.trading.connectors.shoonya.sdk",
     "trading212": "src.trading.connectors.trading212.sdk",
     "mt5": "src.trading.connectors.mt5.sdk",
+    "ctrader": "src.trading.connectors.ctrader.sdk",
 }
 
 
@@ -227,6 +228,18 @@ def _order_classification(connector: str, symbol: str):
     # MT5 covers forex, indices, crypto, and commodities — classify per symbol.
     if connector == "mt5":
         from src.trading.connectors.mt5.classification import classify_symbol
+
+        instrument_name, asset_name = classify_symbol(symbol)
+        instrument = InstrumentType(instrument_name) if instrument_name in ("equity", "crypto") else InstrumentType("equity")
+        try:
+            asset = AssetClass(asset_name) if asset_name else None
+        except ValueError:
+            asset = None
+        return instrument, asset
+
+    # cTrader also covers forex, indices, crypto, and commodities.
+    if connector == "ctrader":
+        from src.trading.connectors.ctrader.classification import classify_symbol
 
         instrument_name, asset_name = classify_symbol(symbol)
         instrument = InstrumentType(instrument_name) if instrument_name in ("equity", "crypto") else InstrumentType("equity")
