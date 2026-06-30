@@ -21,7 +21,12 @@ from src.copy_trade.engine import _extract_equity, _extract_positions
 from src.copy_trade.models import MIN_QTY_THRESHOLD, OrderResult
 from src.copy_trade.signal_generator import generate_signal
 from src.copy_trade.signal_models import Signal, SignalConfig, SignalCycleResult
-from src.copy_trade.state import append_signal_cycle_result, utc_now_iso
+from src.copy_trade.state import (
+    append_signal_cycle_result,
+    get_day_start_equity,
+    get_prop_firm_rules,
+    utc_now_iso,
+)
 from src.trading.service import get_account, get_historical_bars, get_positions, get_quote, place_order
 
 logger = logging.getLogger(__name__)
@@ -55,7 +60,30 @@ def run_signal_cycle(
     except Exception as exc:
         logger.debug("[signal] Could not read equity: %s", exc)
 
-    # 2. Read current positions (to avoid doubling into existing).
+    # 2. Prop firm rule check — halt before generating any signals.
+    pf_rules = get_prop_firm_rules(config.config_id)
+    if pf_rules is not None and pf_rules.enabled and equity is not None:
+        from src.copy_trade.prop_firm import check_rules
+
+        day_start = get_day_start_equity(config.config_id)
+        pf_check = check_rules(pf_rules, equity, day_start, ts=ts)
+
+        if pf_check.should_halt:
+            halt_msgs = [c.message for c in pf_check.checks if c.status == "halt"]
+            logger.warning("[signal] PROP FIRM HALT config=%s: %s", config.config_id, halt_msgs)
+            result.errors.append({
+                "symbol": "*",
+                "error": f"Prop firm rule halt: {'; '.join(halt_msgs)}",
+                "prop_firm_halted": True,
+            })
+            append_signal_cycle_result(result)
+            return result
+
+        if pf_check.should_alert:
+            alert_msgs = [c.message for c in pf_check.checks if c.status in ("alert", "target_reached")]
+            logger.info("[signal] PROP FIRM ALERT config=%s: %s", config.config_id, alert_msgs)
+
+    # 3. Read current positions (to avoid doubling into existing).
     current_positions: dict[str, float] = {}
     try:
         pos_raw = get_positions(config.profile_id)
@@ -63,7 +91,7 @@ def run_signal_cycle(
     except Exception as exc:
         logger.debug("[signal] Could not read positions: %s", exc)
 
-    # 3. Generate signals for each symbol.
+    # 4. Generate signals for each symbol.
     signals: list[Signal] = []
     for symbol in config.watchlist:
         try:
@@ -88,7 +116,7 @@ def run_signal_cycle(
         signals.append(sig)
         result.signals.append(sig.to_dict())
 
-    # 4. Filter actionable signals.
+    # 5. Filter actionable signals.
     actionable = [
         s for s in signals
         if s.direction in ("buy", "sell") and s.confidence >= config.min_confidence
