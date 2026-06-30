@@ -25,7 +25,7 @@ from src.copy_trade.models import (
     OrderResult,
     PositionDelta,
 )
-from src.copy_trade.state import append_cycle_result, utc_now_iso
+from src.copy_trade.state import append_cycle_result, get_day_start_equity, get_prop_firm_rules, utc_now_iso
 from src.trading.service import get_account, get_positions, place_order
 
 logger = logging.getLogger(__name__)
@@ -221,7 +221,36 @@ def run_copy_trade_cycle(config: CopyTradeConfig, session_id: str = "") -> CopyT
         {"symbol": s, "quantity": q} for s, q in follower_positions.items()
     ]
 
-    # 3. Compute deltas.
+    # 3. Prop firm rule check — runs before any orders are placed.
+    pf_rules = get_prop_firm_rules(config.config_id)
+    if pf_rules is not None and pf_rules.enabled and result.equity_before is not None:
+        from src.copy_trade.prop_firm import check_rules
+
+        day_start = get_day_start_equity(config.config_id)
+        pf_check = check_rules(pf_rules, result.equity_before, day_start, ts=ts)
+        result.prop_firm_check = pf_check.to_dict()
+
+        if pf_check.should_halt:
+            result.prop_firm_halted = True
+            halt_msgs = [c.message for c in pf_check.checks if c.status == "halt"]
+            logger.warning("[copy_trade] PROP FIRM HALT config=%s: %s", config.config_id, halt_msgs)
+            result.errors.append(
+                OrderResult(
+                    symbol="*",
+                    side="",
+                    quantity=0,
+                    status="skipped",
+                    skip_reason=f"Prop firm rule halt: {'; '.join(halt_msgs)}",
+                ).to_dict()
+            )
+            append_cycle_result(result)
+            return result
+
+        if pf_check.should_alert:
+            alert_msgs = [c.message for c in pf_check.checks if c.status in ("alert", "target_reached")]
+            logger.info("[copy_trade] PROP FIRM ALERT config=%s: %s", config.config_id, alert_msgs)
+
+    # 4. Compute deltas.
     deltas = compute_deltas(leader_positions, follower_positions, config.scale_ratio)
 
     if not deltas:
@@ -229,7 +258,7 @@ def run_copy_trade_cycle(config: CopyTradeConfig, session_id: str = "") -> CopyT
         append_cycle_result(result)
         return result
 
-    # 4. Place orders.
+    # 5. Place orders.
     for delta in deltas:
         qty = delta.quantity
 

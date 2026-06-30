@@ -1,11 +1,13 @@
 """Copy Trade tools — auto-discovered by the tool registry.
 
-Five tools:
+Seven tools:
     setup_copy_trade        — create / update a copy-trade config
     run_copy_trade_cycle    — execute one sync cycle (read leader, mirror to follower)
     get_copy_trade_status   — list configs + recent cycle history
     get_copy_trade_pnl      — daily P&L report with equity curve
     stop_copy_trade         — disable or delete a copy-trade config
+    setup_prop_firm_rules   — attach prop firm drawdown/target rules to a config
+    get_prop_firm_status    — live prop firm rule check against current equity
 """
 
 from __future__ import annotations
@@ -465,4 +467,230 @@ class GetCopyTradePnLTool(BaseTool):
             )
         except Exception as exc:
             logger.exception("get_copy_trade_pnl failed")
+            return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: setup_prop_firm_rules
+# ---------------------------------------------------------------------------
+
+
+class SetupPropFirmRulesTool(BaseTool):
+    """Attach prop firm trading rules to a copy-trade config."""
+
+    name = "setup_prop_firm_rules"
+    description = (
+        "Configure prop firm drawdown and profit-target rules for a copy-trade config. "
+        "Once set, every run_copy_trade_cycle call checks these rules before placing orders "
+        "and halts automatically if a limit is approached, protecting the funded account. "
+        "Use a preset (ftmo, apex, mff, tft, e8) or enter custom limits manually."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "config_id": {
+                "type": "string",
+                "description": "Copy-trade config id to attach these rules to.",
+            },
+            "initial_balance": {
+                "type": "number",
+                "description": "Funded account starting balance (e.g. 50000 for a $50k account).",
+            },
+            "preset": {
+                "type": "string",
+                "description": (
+                    "Named prop firm preset: 'ftmo', 'apex', 'mff' (MyForexFunds), "
+                    "'tft' (The Funded Trader), 'e8' (E8 Funding). "
+                    "Overrides daily/total drawdown and profit target with firm-specific values."
+                ),
+            },
+            "firm_name": {
+                "type": "string",
+                "description": "Human-readable firm name (e.g. 'FTMO'). Auto-set when using a preset.",
+            },
+            "daily_drawdown_limit_pct": {
+                "type": "number",
+                "description": "Max allowed daily equity drop as % of day-start equity (e.g. 5.0 for 5%).",
+            },
+            "total_drawdown_limit_pct": {
+                "type": "number",
+                "description": "Max allowed total equity drop from initial_balance (e.g. 10.0 for 10%).",
+            },
+            "profit_target_pct": {
+                "type": "number",
+                "description": "Challenge profit target as % of initial_balance (e.g. 10.0 for 10%).",
+            },
+            "alert_pct": {
+                "type": "number",
+                "description": "Alert when this % of a limit is consumed (default 80).",
+                "default": 80.0,
+            },
+            "halt_pct": {
+                "type": "number",
+                "description": "Halt orders when this % of a limit is consumed (default 95).",
+                "default": 95.0,
+            },
+        },
+        "required": ["config_id", "initial_balance"],
+    }
+    is_readonly = False
+
+    def execute(self, **kwargs: Any) -> str:
+        try:
+            from src.copy_trade import get_config
+            from src.copy_trade.prop_firm import PROP_FIRM_PRESETS, PropFirmRules
+            from src.copy_trade.state import save_prop_firm_rules
+
+            config_id = str(kwargs["config_id"]).strip()
+            if get_config(config_id) is None:
+                return _err(f"No copy-trade config found with id '{config_id}'.")
+
+            initial_balance = float(kwargs["initial_balance"])
+            if initial_balance <= 0:
+                return _err("initial_balance must be positive.")
+
+            preset = str(kwargs.get("preset", "")).strip().lower()
+
+            if preset:
+                rules = PropFirmRules.from_preset(config_id, preset, initial_balance)
+                if not rules.firm_name:
+                    return _err(
+                        f"Unknown preset '{preset}'. "
+                        f"Available: {', '.join(PROP_FIRM_PRESETS.keys())}"
+                    )
+            else:
+                rules = PropFirmRules(
+                    config_id=config_id,
+                    firm_name=str(kwargs.get("firm_name", "")).strip(),
+                    initial_balance=initial_balance,
+                    daily_drawdown_limit_pct=float(kwargs.get("daily_drawdown_limit_pct", 5.0)),
+                    total_drawdown_limit_pct=float(kwargs.get("total_drawdown_limit_pct", 10.0)),
+                    profit_target_pct=float(kwargs.get("profit_target_pct", 10.0)),
+                    alert_pct=float(kwargs.get("alert_pct", 80.0)),
+                    halt_pct=float(kwargs.get("halt_pct", 95.0)),
+                )
+
+            save_prop_firm_rules(rules)
+
+            daily_buffer = round(initial_balance * rules.daily_drawdown_limit_pct / 100, 2)
+            total_buffer = round(initial_balance * rules.total_drawdown_limit_pct / 100, 2)
+            profit_needed = round(initial_balance * rules.profit_target_pct / 100, 2)
+
+            return _ok(
+                config_id=config_id,
+                firm_name=rules.firm_name,
+                initial_balance=initial_balance,
+                daily_drawdown_limit_pct=rules.daily_drawdown_limit_pct,
+                total_drawdown_limit_pct=rules.total_drawdown_limit_pct,
+                profit_target_pct=rules.profit_target_pct,
+                alert_pct=rules.alert_pct,
+                halt_pct=rules.halt_pct,
+                daily_buffer_currency=daily_buffer,
+                total_buffer_currency=total_buffer,
+                profit_target_currency=profit_needed,
+                message=(
+                    f"Prop firm rules set for '{config_id}' "
+                    f"({rules.firm_name or 'custom'}, ${initial_balance:,.0f} account). "
+                    f"Daily buffer: ${daily_buffer:,.2f} | Total buffer: ${total_buffer:,.2f} | "
+                    f"Target profit: ${profit_needed:,.2f}. "
+                    "run_copy_trade_cycle will now enforce these limits automatically."
+                ),
+            )
+        except Exception as exc:
+            logger.exception("setup_prop_firm_rules failed")
+            return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: get_prop_firm_status
+# ---------------------------------------------------------------------------
+
+
+class GetPropFirmStatusTool(BaseTool):
+    """Live prop firm rule check against the follower account's current equity."""
+
+    name = "get_prop_firm_status"
+    description = (
+        "Run a live prop firm rule check: reads the follower account's current equity "
+        "and evaluates it against the configured daily drawdown, total drawdown, and "
+        "profit target limits. Shows exactly how much buffer remains before a halt "
+        "and tracks progress toward the challenge profit target."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "config_id": {
+                "type": "string",
+                "description": "Copy-trade config id to check.",
+            },
+        },
+        "required": ["config_id"],
+    }
+    is_readonly = True
+    repeatable = True
+
+    def execute(self, **kwargs: Any) -> str:
+        try:
+            from src.copy_trade import get_config
+            from src.copy_trade.prop_firm import check_rules
+            from src.copy_trade.state import (
+                get_day_start_equity,
+                get_prop_firm_rules,
+            )
+            from src.copy_trade.state import utc_now_iso
+            from src.copy_trade.engine import _extract_equity
+            from src.trading.service import get_account
+
+            config_id = str(kwargs["config_id"]).strip()
+            config = get_config(config_id)
+            if config is None:
+                return _err(f"No copy-trade config found with id '{config_id}'.")
+
+            rules = get_prop_firm_rules(config_id)
+            if rules is None:
+                return _err(
+                    f"No prop firm rules configured for '{config_id}'. "
+                    "Call setup_prop_firm_rules first."
+                )
+
+            # Read current equity from follower account.
+            try:
+                acct = get_account(config.follower_profile_id)
+                current_equity, _ = _extract_equity(acct)
+            except Exception as exc:
+                return _err(f"Could not read follower account equity: {exc}")
+
+            if current_equity is None:
+                return _err(
+                    "Follower account did not return equity data. "
+                    "Try running run_copy_trade_cycle once to capture a snapshot."
+                )
+
+            day_start = get_day_start_equity(config_id)
+            ts = utc_now_iso()
+            result = check_rules(rules, current_equity, day_start, ts=ts)
+
+            # Format a readable status block.
+            status_icon = "🛑 HALTED" if result.should_halt else ("⚠️ ALERT" if result.should_alert else "✅ OK")
+            lines = [
+                f"Prop Firm Status — {rules.firm_name or 'Custom'} ({config_id})",
+                f"Overall: {status_icon}",
+                f"Account: ${current_equity:,.2f}  |  Initial: ${rules.initial_balance:,.2f}",
+                "─" * 48,
+            ]
+            lines.extend(result.summary_lines())
+
+            return _ok(
+                config_id=config_id,
+                firm_name=rules.firm_name,
+                should_halt=result.should_halt,
+                should_alert=result.should_alert,
+                current_equity=current_equity,
+                day_start_equity=day_start,
+                initial_balance=rules.initial_balance,
+                checks=[c.to_dict() for c in result.checks],
+                text="\n".join(lines),
+            )
+        except Exception as exc:
+            logger.exception("get_prop_firm_status failed")
             return _err(str(exc))

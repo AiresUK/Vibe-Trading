@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from src.copy_trade.models import CopyTradeConfig, CopyTradeCycleResult
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from src.copy_trade.prop_firm import PropFirmRules
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,10 @@ def _copy_trade_root() -> Path:
 
 def _configs_path() -> Path:
     return _copy_trade_root() / "configs.json"
+
+
+def _prop_firm_rules_path() -> Path:
+    return _copy_trade_root() / "prop_firm_rules.json"
 
 
 def _cycle_log_path(config_id: str) -> Path:
@@ -117,3 +124,79 @@ def load_recent_cycles(config_id: str, n: int = 10) -> list[dict[str, Any]]:
         except Exception:
             pass
     return results
+
+
+def get_day_start_equity(config_id: str) -> float | None:
+    """Return the first equity_before reading from today's cycles, or None.
+
+    Used by the prop firm monitor to compute daily drawdown from today's open.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    log_path = _cycle_log_path(config_id)
+    if not log_path.exists():
+        return None
+    lines = [l for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    for line in lines:  # oldest first (file is append-only)
+        try:
+            record = json.loads(line)
+            ts = str(record.get("ts", ""))[:10]
+            if ts == today:
+                eq = record.get("equity_before")
+                if eq is not None:
+                    return float(eq)
+        except Exception:
+            pass
+    return None
+
+
+# ---- Prop firm rules CRUD ---------------------------------------------
+
+
+def load_all_prop_firm_rules() -> dict[str, Any]:
+    """Return all stored prop firm rule sets keyed by config_id."""
+    path = _prop_firm_rules_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not load prop firm rules: %s", exc)
+        return {}
+
+
+def save_prop_firm_rules(rules: "PropFirmRules") -> None:
+    """Persist prop firm rules for a config (upsert by config_id)."""
+    all_rules = load_all_prop_firm_rules()
+    all_rules[rules.config_id] = rules.to_dict()
+    _prop_firm_rules_path().write_text(
+        json.dumps(all_rules, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def get_prop_firm_rules(config_id: str) -> "PropFirmRules | None":
+    """Load prop firm rules for a config, or None if not configured."""
+    from src.copy_trade.prop_firm import PropFirmRules
+
+    all_rules = load_all_prop_firm_rules()
+    data = all_rules.get(config_id)
+    if data is None:
+        return None
+    try:
+        return PropFirmRules.from_dict(data)
+    except Exception as exc:
+        logger.warning("Could not parse prop firm rules for %s: %s", config_id, exc)
+        return None
+
+
+def delete_prop_firm_rules(config_id: str) -> bool:
+    """Remove prop firm rules for a config; returns True if they existed."""
+    all_rules = load_all_prop_firm_rules()
+    if config_id not in all_rules:
+        return False
+    del all_rules[config_id]
+    _prop_firm_rules_path().write_text(
+        json.dumps(all_rules, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return True

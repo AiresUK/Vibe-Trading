@@ -117,6 +117,8 @@ class CopyTradeCycleResult:
     equity_before: float | None = None
     equity_after: float | None = None
     balance_before: float | None = None
+    prop_firm_check: dict[str, Any] | None = None
+    prop_firm_halted: bool = False
     ts: str = ""
 
     def to_dict(self) -> dict[str, Any]:
