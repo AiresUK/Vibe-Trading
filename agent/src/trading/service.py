@@ -23,6 +23,7 @@ _SDK_CONNECTOR_MODULES = {
     "dhan": "src.trading.connectors.dhan.sdk",
     "shoonya": "src.trading.connectors.shoonya.sdk",
     "trading212": "src.trading.connectors.trading212.sdk",
+    "mt5": "src.trading.connectors.mt5.sdk",
 }
 
 
@@ -216,12 +217,24 @@ def _order_classification(connector: str, symbol: str):
 
     Crypto connectors are unambiguous; multi-market equity connectors infer the
     asset class from the symbol's market tag (``.HK``/``HK.`` → HK, ``.US``/``US.``
-    → US, ``.SH``/``.SZ``/``CN.`` → A-share). When the market cannot be inferred
-    the asset class is ``None`` and the gate falls back to the US default — which
-    only ever DENIES (never silently widens) when the user's mandate permits a
-    non-US class, so the unknown case is fail-safe.
+    → US, ``.SH``/``.SZ``/``CN.`` → A-share). MT5 uses per-symbol classification.
+    When the market cannot be inferred the asset class is ``None`` and the gate
+    falls back to the US default — which only ever DENIES (never silently widens)
+    when the user's mandate permits a non-US class, so the unknown case is fail-safe.
     """
     from src.live.mandate.model import AssetClass, InstrumentType
+
+    # MT5 covers forex, indices, crypto, and commodities — classify per symbol.
+    if connector == "mt5":
+        from src.trading.connectors.mt5.classification import classify_symbol
+
+        instrument_name, asset_name = classify_symbol(symbol)
+        instrument = InstrumentType(instrument_name) if instrument_name in ("equity", "crypto") else InstrumentType("equity")
+        try:
+            asset = AssetClass(asset_name) if asset_name else None
+        except ValueError:
+            asset = None
+        return instrument, asset
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))
     instrument = InstrumentType(instrument_name)
