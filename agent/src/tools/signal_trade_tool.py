@@ -1,9 +1,11 @@
 """AI signal-based trading tools.
 
-Three tools:
-- setup_signal_trade     — configure a watchlist + AI signal strategy
-- run_signal_cycle       — analyse market with AI, auto-place trades
-- get_signal_status      — view configs and recent cycle history
+Five tools:
+- setup_signal_trade        — configure a watchlist + AI signal strategy
+- run_signal_cycle          — analyse market with AI, auto-place trades
+- get_signal_status         — view configs and recent cycle history
+- start_signal_scheduler    — start the background auto-trading scheduler
+- stop_signal_scheduler     — stop the background scheduler
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ class SetupSignalTradeTool(BaseTool):
         "min_confidence (0.0-1.0, default 0.65 — minimum AI confidence to trade), "
         "risk_per_trade_pct (0.1-5.0, default 1.0 — % of equity per trade), "
         "max_positions (1-20, default 5), "
+        "interval_minutes (int, e.g. 30 — run automatically every N minutes; omit for manual only), "
         "label (optional name)."
     )
 
@@ -102,6 +105,16 @@ class SetupSignalTradeTool(BaseTool):
         except (TypeError, ValueError):
             return "Error: max_positions must be an integer."
 
+        interval_raw = kwargs.get("interval_minutes")
+        interval_minutes: int | None = None
+        if interval_raw is not None and str(interval_raw).strip():
+            try:
+                interval_minutes = int(interval_raw)
+                if interval_minutes < 5:
+                    return "Error: interval_minutes must be at least 5."
+            except (TypeError, ValueError):
+                return "Error: interval_minutes must be an integer."
+
         label = str(kwargs.get("label", "")).strip()
 
         # Reuse existing config if updating.
@@ -118,6 +131,7 @@ class SetupSignalTradeTool(BaseTool):
             min_confidence=min_confidence,
             risk_per_trade_pct=risk_per_trade_pct,
             max_positions=max_positions,
+            interval_minutes=interval_minutes,
             enabled=True,
             label=label,
         )
@@ -134,12 +148,18 @@ class SetupSignalTradeTool(BaseTool):
             f"  Risk       : {risk_per_trade_pct}% of equity per trade",
             f"  Max open   : {max_positions} positions",
         ]
+        if interval_minutes:
+            lines.append(f"  Auto-run   : every {interval_minutes} minutes")
+        else:
+            lines.append("  Auto-run   : manual only (use start_signal_scheduler to enable)")
         if label:
             lines.append(f"  Label      : {label}")
         lines.append(f"\n({total} signal config(s) total)")
+        if interval_minutes:
+            lines.append("\nStart the scheduler: start_signal_scheduler")
         lines.append(
-            "\nRun a cycle: run_signal_cycle config_id=" + config_id
-            + "\nOr preview first: run_signal_cycle config_id=" + config_id + " dry_run=true"
+            "Run manually: run_signal_cycle config_id=" + config_id
+            + "\nPreview: run_signal_cycle config_id=" + config_id + " dry_run=true"
         )
         return "\n".join(lines)
 
@@ -281,7 +301,10 @@ class GetSignalStatusTool(BaseTool):
                 return f"Config '{config_id}' not found."
             configs = {config_id: cfg}
 
-        lines: list[str] = [f"AI Signal Trading — {len(configs)} config(s)", ""]
+        from src.copy_trade.signal_scheduler import scheduler_running
+
+        sched_status = "running" if scheduler_running() else "stopped"
+        lines: list[str] = [f"AI Signal Trading — {len(configs)} config(s)  |  Scheduler: {sched_status}", ""]
         for cid, cfg in configs.items():
             status = "✅ enabled" if cfg.enabled else "⏸ disabled"
             label = f" — {cfg.label}" if cfg.label else ""
@@ -296,6 +319,10 @@ class GetSignalStatusTool(BaseTool):
                 f"  Risk      : {cfg.risk_per_trade_pct}% per trade  "
                 f"|  Max positions: {cfg.max_positions}"
             )
+            if cfg.interval_minutes:
+                lines.append(f"  Auto-run  : every {cfg.interval_minutes} min")
+            else:
+                lines.append("  Auto-run  : manual only")
 
             cycles = load_recent_signal_cycles(cid, n=n_cycles)
             if cycles:
@@ -315,3 +342,93 @@ class GetSignalStatusTool(BaseTool):
             lines.append("")
 
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# StartSignalSchedulerTool
+# ---------------------------------------------------------------------------
+
+
+class StartSignalSchedulerTool(BaseTool):
+    """Start the background AI signal scheduler.
+
+    Once started, the scheduler runs in a background thread and fires a signal
+    cycle for every enabled config whose ``interval_minutes`` has elapsed. It
+    survives conversational turns and keeps trading automatically until stopped.
+
+    To configure an auto-run interval use ``setup_signal_trade ... interval_minutes=30``.
+    """
+
+    name = "start_signal_scheduler"
+    description = (
+        "Start the background scheduler that automatically runs AI signal cycles "
+        "on the configured interval (e.g. every 30 minutes). "
+        "Only configs with interval_minutes set are affected. "
+        "The scheduler runs in the background — you do not need to do anything "
+        "else; it will keep trading until you call stop_signal_scheduler. "
+        "No parameters required."
+    )
+
+    def run(self, **kwargs: Any) -> str:
+        from src.copy_trade.signal_scheduler import scheduler_running, start_scheduler
+        from src.copy_trade.state import load_all_signal_configs
+
+        configs = load_all_signal_configs()
+        scheduled = [c for c in configs.values() if c.enabled and c.interval_minutes]
+
+        if not scheduled:
+            return (
+                "No configs have interval_minutes set.\n"
+                "Add an interval first:\n"
+                "  setup_signal_trade config_id=<id> interval_minutes=30\n"
+                "Then start the scheduler again."
+            )
+
+        if scheduler_running():
+            lines = ["Scheduler is already running."]
+        else:
+            start_scheduler()
+            lines = ["✅ Background signal scheduler started."]
+
+        lines.append("")
+        lines.append(f"Auto-trading {len(scheduled)} config(s):")
+        for cfg in scheduled:
+            label = f" ({cfg.label})" if cfg.label else ""
+            lines.append(
+                f"  • [{cfg.config_id}]{label}  every {cfg.interval_minutes} min  "
+                f"— {', '.join(cfg.watchlist)}"
+            )
+        lines.append("")
+        lines.append("The AI will scan and trade automatically on its schedule.")
+        lines.append("Stop anytime: stop_signal_scheduler")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# StopSignalSchedulerTool
+# ---------------------------------------------------------------------------
+
+
+class StopSignalSchedulerTool(BaseTool):
+    """Stop the background AI signal scheduler."""
+
+    name = "stop_signal_scheduler"
+    description = (
+        "Stop the background AI signal scheduler. "
+        "Any cycle currently in progress will finish before the thread exits. "
+        "Existing positions are NOT closed — only new automatic cycles stop. "
+        "No parameters required."
+    )
+
+    def run(self, **kwargs: Any) -> str:
+        from src.copy_trade.signal_scheduler import scheduler_running, stop_scheduler
+
+        if not scheduler_running():
+            return "Scheduler is not currently running."
+
+        stop_scheduler()
+        return (
+            "⏹ Background signal scheduler stopped.\n"
+            "Existing positions remain open — no orders were placed or cancelled.\n"
+            "Restart anytime: start_signal_scheduler"
+        )

@@ -31,6 +31,7 @@ class SignalConfig:
     min_confidence: float = 0.65
     risk_per_trade_pct: float = 1.0
     max_positions: int = 5
+    interval_minutes: int | None = None  # None = manual only; set to run automatically
     enabled: bool = True
     label: str = ""
 
