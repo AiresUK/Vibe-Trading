@@ -26,9 +26,58 @@ from src.copy_trade.models import (
     PositionDelta,
 )
 from src.copy_trade.state import append_cycle_result, utc_now_iso
-from src.trading.service import get_positions, place_order
+from src.trading.service import get_account, get_positions, place_order
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_equity(raw: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Parse connector ``get_account`` response into (equity, balance).
+
+    Returns ``(None, None)`` when the account snapshot doesn't include equity
+    (some brokers only expose balance).
+    """
+    equity = None
+    balance = None
+    for key in ("equity", "net_liquidation", "net_liq", "total_equity"):
+        val = raw.get(key)
+        if val is not None:
+            try:
+                equity = float(val)
+                break
+            except (TypeError, ValueError):
+                pass
+    for key in ("balance", "cash", "cash_balance", "buying_power"):
+        val = raw.get(key)
+        if val is not None:
+            try:
+                balance = float(val)
+                break
+            except (TypeError, ValueError):
+                pass
+    # Some connectors nest under "account" or "cash"
+    for wrapper_key in ("account", "cash"):
+        nested = raw.get(wrapper_key)
+        if isinstance(nested, dict):
+            if equity is None:
+                for key in ("equity", "net_liquidation", "net_liq", "totalCash"):
+                    val = nested.get(key)
+                    if val is not None:
+                        try:
+                            equity = float(val)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+            if balance is None:
+                for key in ("balance", "cash", "availableFunds", "totalCash"):
+                    val = nested.get(key)
+                    if val is not None:
+                        try:
+                            balance = float(val)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+    return equity, balance
 
 
 def _extract_positions(raw: dict[str, Any]) -> dict[str, float]:
@@ -124,6 +173,13 @@ def run_copy_trade_cycle(config: CopyTradeConfig, session_id: str = "") -> CopyT
     """
     ts = utc_now_iso()
     result = CopyTradeCycleResult(config_id=config.config_id, ts=ts)
+
+    # 0. Snapshot follower equity before any orders.
+    try:
+        acct_before = get_account(config.follower_profile_id)
+        result.equity_before, result.balance_before = _extract_equity(acct_before)
+    except Exception as exc:
+        logger.debug("[copy_trade] Could not read follower equity (before): %s", exc)
 
     # 1. Read leader positions.
     try:
@@ -258,6 +314,13 @@ def run_copy_trade_cycle(config: CopyTradeConfig, session_id: str = "") -> CopyT
                 config.follower_profile_id,
                 error_msg,
             )
+
+    # 5. Snapshot follower equity after orders.
+    try:
+        acct_after = get_account(config.follower_profile_id)
+        result.equity_after, _ = _extract_equity(acct_after)
+    except Exception as exc:
+        logger.debug("[copy_trade] Could not read follower equity (after): %s", exc)
 
     append_cycle_result(result)
     return result

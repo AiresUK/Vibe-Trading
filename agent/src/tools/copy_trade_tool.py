@@ -1,9 +1,10 @@
 """Copy Trade tools — auto-discovered by the tool registry.
 
-Four tools:
+Five tools:
     setup_copy_trade        — create / update a copy-trade config
     run_copy_trade_cycle    — execute one sync cycle (read leader, mirror to follower)
     get_copy_trade_status   — list configs + recent cycle history
+    get_copy_trade_pnl      — daily P&L report with equity curve
     stop_copy_trade         — disable or delete a copy-trade config
 """
 
@@ -396,4 +397,72 @@ class StopCopyTradeTool(BaseTool):
                 )
         except Exception as exc:
             logger.exception("stop_copy_trade failed")
+            return _err(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: get_copy_trade_pnl
+# ---------------------------------------------------------------------------
+
+
+class GetCopyTradePnLTool(BaseTool):
+    """Daily P&L report for a copy-trade config."""
+
+    name = "get_copy_trade_pnl"
+    description = (
+        "Return a daily P&L breakdown for a copy-trade config: equity open/close, "
+        "daily P&L in USD and %, win rate, best/worst day, and an equity curve for "
+        "charting. Equity snapshots are captured automatically at the start and end "
+        "of every run_copy_trade_cycle call. Call this to review performance."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "config_id": {
+                "type": "string",
+                "description": "Copy-trade config id to report on.",
+            },
+            "days": {
+                "type": "integer",
+                "description": "Number of calendar days to include in the report (default 7, max 90).",
+                "default": 7,
+            },
+        },
+        "required": ["config_id"],
+    }
+    is_readonly = True
+    repeatable = True
+
+    def execute(self, **kwargs: Any) -> str:
+        try:
+            from src.copy_trade import get_config
+            from src.copy_trade.reporter import build_daily_pnl_report, format_pnl_report_text
+
+            config_id = str(kwargs["config_id"]).strip()
+            days = max(1, min(int(kwargs.get("days", 7)), 90))
+
+            if get_config(config_id) is None:
+                return _err(f"No copy-trade config found with id '{config_id}'.")
+
+            report = build_daily_pnl_report(config_id, days=days)
+            summary = report["summary"]
+
+            if summary["days_with_data"] == 0:
+                return _ok(
+                    config_id=config_id,
+                    report=report,
+                    text=(
+                        "No equity data yet. Equity snapshots are captured each time "
+                        "run_copy_trade_cycle runs — call that first to start tracking P&L."
+                    ),
+                )
+
+            text = format_pnl_report_text(report)
+            return _ok(
+                config_id=config_id,
+                report=report,
+                text=text,
+            )
+        except Exception as exc:
+            logger.exception("get_copy_trade_pnl failed")
             return _err(str(exc))

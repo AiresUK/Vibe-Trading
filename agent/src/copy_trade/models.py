@@ -102,6 +102,9 @@ class CopyTradeCycleResult:
         errors: OrderResult dicts where status == "error".
         leader_positions: Raw positions from the leader at cycle start.
         follower_positions_before: Raw follower positions before any orders.
+        equity_before: Follower account equity before orders (USD).
+        equity_after: Follower account equity after orders (USD).
+        balance_before: Follower account cash balance before orders (USD).
         ts: ISO-8601 UTC timestamp of cycle start.
     """
 
@@ -111,7 +114,40 @@ class CopyTradeCycleResult:
     errors: list[dict[str, Any]] = field(default_factory=list)
     leader_positions: list[dict[str, Any]] = field(default_factory=list)
     follower_positions_before: list[dict[str, Any]] = field(default_factory=list)
+    equity_before: float | None = None
+    equity_after: float | None = None
+    balance_before: float | None = None
     ts: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DailyPnL:
+    """Aggregated P&L for one calendar day.
+
+    Attributes:
+        date: Calendar date string (YYYY-MM-DD).
+        equity_open: First equity reading of the day (follower account).
+        equity_close: Last equity reading of the day (follower account).
+        pnl: equity_close - equity_open.
+        pnl_pct: P&L as a percentage of equity_open.
+        cycles: Number of sync cycles run that day.
+        orders_placed: Total orders placed that day.
+        orders_skipped: Total orders skipped that day.
+        errors: Total errors that day.
+    """
+
+    date: str
+    equity_open: float | None = None
+    equity_close: float | None = None
+    pnl: float | None = None
+    pnl_pct: float | None = None
+    cycles: int = 0
+    orders_placed: int = 0
+    orders_skipped: int = 0
+    errors: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
