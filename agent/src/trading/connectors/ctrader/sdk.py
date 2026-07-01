@@ -510,6 +510,29 @@ class _NewOrderRequest(_RequestHandler):
             stop(client)
 
 
+class _ClosePositionRequest(_RequestHandler):
+    def __init__(self, account_id: int, position_id: int, volume: int) -> None:
+        self._account_id = account_id
+        self._position_id = position_id
+        self._volume = volume
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAClosePositionReq
+        req = ProtoOAClosePositionReq()
+        req.ctidTraderAccountId = self._account_id
+        req.positionId = self._position_id
+        req.volume = self._volume
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAExecutionEvent
+        if msg.payloadType == ProtoOAExecutionEvent().payloadType:
+            res = ProtoOAExecutionEvent()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
 class _CancelOrderRequest(_RequestHandler):
     def __init__(self, account_id: int, order_id: int) -> None:
         self._account_id = account_id
@@ -739,6 +762,21 @@ def place_order(
     if take_profit is not None:
         result["take_profit"] = take_profit
     return result
+
+
+def close_position(
+    config: CTraderConfig,
+    *,
+    position_id: int,
+    volume: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    res = _execute(config, _ClosePositionRequest(config.account_id, int(position_id), int(volume)))
+    return {
+        "position_id": position_id,
+        "status": "closed",
+        "execution_type": res.executionType,
+    }
 
 
 def cancel_order(order_id: str, config: CTraderConfig, **kwargs: Any) -> dict[str, Any]:

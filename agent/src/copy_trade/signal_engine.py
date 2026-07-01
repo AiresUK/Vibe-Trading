@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from datetime import datetime, timezone
+
 from src.copy_trade.engine import _extract_equity, _extract_positions
 from src.copy_trade.models import MIN_QTY_THRESHOLD, OrderResult
 from src.copy_trade.signal_generator import generate_signal
@@ -25,15 +27,19 @@ from src.copy_trade.state import (
     append_signal_cycle_result,
     get_day_start_equity,
     get_prop_firm_rules,
+    load_tracked_positions,
+    remove_tracked_position,
+    save_tracked_position,
     utc_now_iso,
 )
-from src.trading.service import get_account, get_historical_bars, get_positions, get_quote, place_order
+from src.trading.service import close_position, get_account, get_historical_bars, get_positions, get_quote, place_order
 
 logger = logging.getLogger(__name__)
 
 _ATR_PERIOD = 14
-_SL_ATR_MULTIPLE = 2.0   # stop loss = 2× ATR from entry
-_TP_ATR_MULTIPLE = 3.0   # take profit = 3× ATR (1:1.5 R:R) — bonus target only
+_SL_ATR_MULTIPLE = 2.0   # stop loss = 2× ATR — wide enough to survive noise
+_TP1_ATR_MULTIPLE = 1.5  # TP1 = 1.5× ATR — first target, closes 50% of position
+_TP2_ATR_MULTIPLE = 3.0  # TP2 = 3× ATR — bonus target, closes remaining 50%
 
 
 def _compute_atr(bars_raw: dict, period: int = _ATR_PERIOD) -> float | None:
@@ -107,7 +113,44 @@ def run_signal_cycle(
             alert_msgs = [c.message for c in pf_check.checks if c.status in ("alert", "target_reached")]
             logger.info("[signal] PROP FIRM ALERT config=%s: %s", config.config_id, alert_msgs)
 
-    # 3. Read current positions (to avoid doubling into existing).
+    # 3. Time-based exit — close positions older than max_trade_hours.
+    now_dt = datetime.now(timezone.utc)
+    max_hours = getattr(config, "max_trade_hours", 48)
+    tracked = load_tracked_positions(config.config_id)
+    for pid, pos_info in list(tracked.items()):
+        try:
+            entry_dt = datetime.fromisoformat(pos_info["entry_time"])
+            age_hours = (now_dt - entry_dt).total_seconds() / 3600
+        except Exception:
+            continue
+        if age_hours >= max_hours:
+            try:
+                if not dry_run:
+                    close_position(
+                        int(pos_info["position_id"]),
+                        config.profile_id,
+                        volume=int(pos_info["volume"]),
+                    )
+                    remove_tracked_position(config.config_id, pid)
+                result.orders_placed.append({
+                    "symbol": pos_info["symbol"],
+                    "side": "close",
+                    "reason": f"time_exit_{max_hours}h",
+                    "position_id": pid,
+                    "age_hours": round(age_hours, 1),
+                    "status": "dry_run" if dry_run else "closed",
+                })
+                logger.info(
+                    "[signal] Time exit: closed %s %s after %.1fh",
+                    pos_info["side"].upper(), pos_info["symbol"], age_hours,
+                )
+            except Exception as exc:
+                logger.warning("[signal] Time exit failed for position %s: %s", pid, exc)
+
+    # Refresh tracked positions after time exits.
+    tracked = load_tracked_positions(config.config_id)
+
+    # 4. Read current positions (to avoid doubling into existing).
     current_positions: dict[str, float] = {}
     try:
         pos_raw = get_positions(config.profile_id)
@@ -139,7 +182,12 @@ def run_signal_cycle(
             logger.debug("[signal] Could not fetch quote for %s: %s", symbol, exc)
             quote_raw = {}
 
-        sig = generate_signal(symbol, bars_raw, quote_raw, config)
+        # Pass tracked position so the AI can evaluate hold-vs-exit.
+        open_pos = next(
+            (p for p in tracked.values() if p.get("symbol") == symbol),
+            None,
+        )
+        sig = generate_signal(symbol, bars_raw, quote_raw, config, open_position=open_pos)
         signals.append(sig)
         result.signals.append(sig.to_dict())
 
@@ -159,12 +207,47 @@ def run_signal_cycle(
     # Separate buys (new positions) and sells (closing positions).
     # Sells on held symbols can always proceed; new buys consume slots.
     sells = [s for s in actionable if s.direction == "sell"]
-    buys = [s for s in actionable if s.direction == "buy"]
-    buys = buys[:available_slots]  # respect position cap for new entries
+    all_buys = [s for s in actionable if s.direction == "buy"]
+    buys = all_buys[:available_slots]  # respect position cap for new entries
 
     to_execute = sells + buys
 
-    # 5. Place orders.
+    # 5. Signal reversal exit — close tracked positions that conflict with new signals.
+    for sig in to_execute:
+        for pid, pos_info in list(tracked.items()):
+            if pos_info.get("symbol") != sig.symbol:
+                continue
+            tracked_side = pos_info.get("side", "")
+            if (tracked_side == "buy" and sig.direction == "sell") or (
+                tracked_side == "sell" and sig.direction == "buy"
+            ):
+                try:
+                    if not dry_run:
+                        close_position(
+                            int(pos_info["position_id"]),
+                            config.profile_id,
+                            volume=int(pos_info["volume"]),
+                        )
+                        remove_tracked_position(config.config_id, pid)
+                    result.orders_placed.append({
+                        "symbol": sig.symbol,
+                        "side": "close",
+                        "reason": f"signal_reversal_{sig.direction}",
+                        "position_id": pid,
+                        "status": "dry_run" if dry_run else "closed",
+                    })
+                    logger.info(
+                        "[signal] Reversal exit: closed %s %s — new signal is %s",
+                        tracked_side.upper(), sig.symbol, sig.direction.upper(),
+                    )
+                except Exception as exc:
+                    logger.warning("[signal] Reversal exit failed for position %s: %s", pid, exc)
+
+    # Refresh tracked positions after reversal exits.
+    if not dry_run:
+        tracked = load_tracked_positions(config.config_id)
+
+    # 6. Place orders (dual TP: 50% at TP1=1.5×ATR, 50% at TP2=3×ATR, same SL=2×ATR).
     for sig in to_execute:
         # Compute order quantity from equity risk.
         qty = 0.0
@@ -174,89 +257,116 @@ def run_signal_cycle(
             qty = round(qty, 8)
 
         if qty < MIN_QTY_THRESHOLD:
-            skip_detail = {
+            result.orders_skipped.append({
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "confidence": sig.confidence,
                 "reason": "quantity below minimum (price or equity unavailable)",
-            }
-            result.orders_skipped.append(skip_detail)
+            })
             logger.info("[signal] %s %s skipped — qty too small", sig.direction.upper(), sig.symbol)
             continue
 
-        # Compute ATR-based stop loss (2× ATR) and take profit (3× ATR bonus).
-        stop_loss: float | None = None
-        take_profit: float | None = None
+        # Compute ATR-based SL and dual TPs; split position into two half-sized orders.
         atr = _compute_atr(bars_by_symbol.get(sig.symbol, {}))
+        orders_to_place: list[dict] = []
         if atr and sig.current_price > 0:
             sl_dist = round(_SL_ATR_MULTIPLE * atr, 5)
-            tp_dist = round(_TP_ATR_MULTIPLE * atr, 5)
+            tp1_dist = round(_TP1_ATR_MULTIPLE * atr, 5)
+            tp2_dist = round(_TP2_ATR_MULTIPLE * atr, 5)
             if sig.direction == "buy":
-                stop_loss = round(sig.current_price - sl_dist, 5)
-                take_profit = round(sig.current_price + tp_dist, 5)
+                sl = round(sig.current_price - sl_dist, 5)
+                tp1 = round(sig.current_price + tp1_dist, 5)
+                tp2 = round(sig.current_price + tp2_dist, 5)
             else:
-                stop_loss = round(sig.current_price + sl_dist, 5)
-                take_profit = round(sig.current_price - tp_dist, 5)
+                sl = round(sig.current_price + sl_dist, 5)
+                tp1 = round(sig.current_price - tp1_dist, 5)
+                tp2 = round(sig.current_price - tp2_dist, 5)
+            half_qty = round(qty / 2, 8)
+            orders_to_place = [
+                {"qty": half_qty, "stop_loss": sl, "take_profit": tp1, "tp_label": "TP1"},
+                {"qty": half_qty, "stop_loss": sl, "take_profit": tp2, "tp_label": "TP2"},
+            ]
             logger.info(
-                "[signal] %s %s SL=%.5f TP=%.5f (ATR=%.5f)",
-                sig.direction.upper(), sig.symbol, stop_loss, take_profit, atr,
+                "[signal] %s %s SL=%.5f TP1=%.5f TP2=%.5f (ATR=%.5f)",
+                sig.direction.upper(), sig.symbol, sl, tp1, tp2, atr,
             )
+        else:
+            orders_to_place = [{"qty": qty, "stop_loss": None, "take_profit": None, "tp_label": ""}]
 
-        if dry_run:
-            result.orders_placed.append({
-                "symbol": sig.symbol,
-                "side": sig.direction,
-                "quantity": qty,
-                "confidence": sig.confidence,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "status": "dry_run",
-                "reasoning": sig.reasoning,
-            })
-            logger.info(
-                "[signal][DRY RUN] Would %s %.4f %s (conf=%.2f) SL=%s TP=%s",
-                sig.direction.upper(), qty, sig.symbol, sig.confidence, stop_loss, take_profit,
-            )
-            continue
+        for order_spec in orders_to_place:
+            o_qty = order_spec["qty"]
+            o_sl = order_spec["stop_loss"]
+            o_tp = order_spec["take_profit"]
+            tp_label = order_spec["tp_label"]
 
-        try:
-            broker_resp = place_order(
-                symbol=sig.symbol,
-                profile_id=config.profile_id,
-                side=sig.direction,
-                quantity=qty,
-                order_type="market",
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                session_id=session_id,
-            )
-            result.orders_placed.append(
-                OrderResult(
+            if dry_run:
+                result.orders_placed.append({
+                    "symbol": sig.symbol,
+                    "side": sig.direction,
+                    "quantity": o_qty,
+                    "confidence": sig.confidence,
+                    "stop_loss": o_sl,
+                    "take_profit": o_tp,
+                    "tp_label": tp_label,
+                    "status": "dry_run",
+                    "reasoning": sig.reasoning,
+                })
+                logger.info(
+                    "[signal][DRY RUN] Would %s %.4f %s (conf=%.2f) SL=%s TP=%s [%s]",
+                    sig.direction.upper(), o_qty, sig.symbol, sig.confidence, o_sl, o_tp, tp_label,
+                )
+                continue
+
+            try:
+                broker_resp = place_order(
                     symbol=sig.symbol,
+                    profile_id=config.profile_id,
                     side=sig.direction,
-                    quantity=qty,
-                    status="placed",
-                    broker_response=broker_resp,
-                ).to_dict()
-            )
-            logger.info(
-                "[signal] %s %.4f %s (conf=%.2f) — OK",
-                sig.direction.upper(), qty, sig.symbol, sig.confidence,
-            )
-        except Exception as exc:
-            result.errors.append(
-                OrderResult(
-                    symbol=sig.symbol,
-                    side=sig.direction,
-                    quantity=qty,
-                    status="error",
-                    error=str(exc),
-                ).to_dict()
-            )
-            logger.warning("[signal] Failed %s %s: %s", sig.direction, sig.symbol, exc)
+                    quantity=o_qty,
+                    order_type="market",
+                    stop_loss=o_sl,
+                    take_profit=o_tp,
+                    session_id=session_id,
+                )
+                pos_id = broker_resp.get("position_id")
+                vol = broker_resp.get("volume", int(round(o_qty * 100000)))
+                result.orders_placed.append(
+                    OrderResult(
+                        symbol=sig.symbol,
+                        side=sig.direction,
+                        quantity=o_qty,
+                        status="placed",
+                        broker_response=broker_resp,
+                    ).to_dict()
+                )
+                if pos_id:
+                    save_tracked_position(
+                        config_id=config.config_id,
+                        position_id=str(pos_id),
+                        symbol=sig.symbol,
+                        side=sig.direction,
+                        entry_time=ts,
+                        entry_price=sig.current_price,
+                        volume=int(vol),
+                    )
+                logger.info(
+                    "[signal] %s %.4f %s (conf=%.2f) [%s] — OK pos_id=%s",
+                    sig.direction.upper(), o_qty, sig.symbol, sig.confidence, tp_label, pos_id,
+                )
+            except Exception as exc:
+                result.errors.append(
+                    OrderResult(
+                        symbol=sig.symbol,
+                        side=sig.direction,
+                        quantity=o_qty,
+                        status="error",
+                        error=str(exc),
+                    ).to_dict()
+                )
+                logger.warning("[signal] Failed %s %s [%s]: %s", sig.direction, sig.symbol, tp_label, exc)
 
     # Skip-record signals that were held back by the position cap.
-    cap_skipped = [s for s in buys[available_slots:] if available_slots < len(buys)]
+    cap_skipped = all_buys[available_slots:]
     for sig in cap_skipped:
         result.orders_skipped.append({
             "symbol": sig.symbol,

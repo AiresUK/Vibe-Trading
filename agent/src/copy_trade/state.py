@@ -273,6 +273,68 @@ def append_signal_cycle_result(result: "SignalCycleResult") -> None:
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ---- Tracked open positions -------------------------------------------
+
+
+def _tracked_positions_path(config_id: str) -> Path:
+    d = _copy_trade_root() / "tracked_positions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{config_id}.json"
+
+
+def save_tracked_position(
+    config_id: str,
+    position_id: str,
+    symbol: str,
+    side: str,
+    entry_time: str,
+    entry_price: float,
+    volume: int,
+) -> None:
+    """Record an open position so the engine can manage time/reversal exits."""
+    path = _tracked_positions_path(config_id)
+    positions: dict[str, Any] = {}
+    if path.exists():
+        try:
+            positions = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    positions[str(position_id)] = {
+        "position_id": str(position_id),
+        "symbol": symbol,
+        "side": side,
+        "entry_time": entry_time,
+        "entry_price": entry_price,
+        "volume": volume,
+        "config_id": config_id,
+    }
+    path.write_text(json.dumps(positions, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_tracked_positions(config_id: str) -> dict[str, dict[str, Any]]:
+    """Return all tracked open positions for a config keyed by position_id."""
+    path = _tracked_positions_path(config_id)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def remove_tracked_position(config_id: str, position_id: str) -> None:
+    """Remove a position from tracking (called after close or SL/TP hit)."""
+    path = _tracked_positions_path(config_id)
+    if not path.exists():
+        return
+    try:
+        positions = json.loads(path.read_text(encoding="utf-8"))
+        positions.pop(str(position_id), None)
+        path.write_text(json.dumps(positions, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def load_recent_signal_cycles(config_id: str, n: int = 10) -> list[dict[str, Any]]:
     """Return the last ``n`` signal cycle results for a config, newest first."""
     log_path = _signal_cycle_log_path(config_id)

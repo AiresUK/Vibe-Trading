@@ -119,11 +119,17 @@ def generate_signal(
     bars_raw: dict[str, Any],
     quote_raw: dict[str, Any],
     config: SignalConfig,
+    open_position: dict[str, Any] | None = None,
 ) -> Signal:
     """Call the configured LLM and return a trading Signal for *symbol*.
 
     Falls back to ``Signal(direction="hold", confidence=0.0)`` on any error so
     the cycle can continue with other symbols.
+
+    Args:
+        open_position: Tracked position dict for this symbol (if one exists).
+            When provided the LLM is explicitly asked to evaluate whether to
+            hold the current position or exit early.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -148,11 +154,34 @@ def generate_signal(
     ohlcv_table = _format_bars(bars, limit=config.lookback_bars)
     context = _compute_context(bars)
 
+    # Build open-position context paragraph if we have a live trade.
+    position_ctx = ""
+    if open_position:
+        pos_side = open_position.get("side", "")
+        entry_price = 0.0
+        try:
+            entry_price = float(open_position.get("entry_price", 0))
+        except (TypeError, ValueError):
+            pass
+        entry_time = open_position.get("entry_time", "")
+        if entry_price > 0 and current_price > 0:
+            raw_pnl = (current_price - entry_price) / entry_price * 100
+            pnl_pct = raw_pnl if pos_side == "buy" else -raw_pnl
+            position_ctx = (
+                f"\nOPEN POSITION: You have an open {pos_side.upper()} entered at {entry_price:.5f} "
+                f"(opened {entry_time}). Current price: {current_price:.5f} "
+                f"(unrealised P&L: {pnl_pct:+.2f}%). "
+                "Re-evaluate this position: if the trade is going against you and structure supports exit, "
+                "signal the opposite direction to close it early. "
+                "If momentum still favours the original direction, signal that same direction (or 'hold' if unsure)."
+            )
+
     user_msg = (
         f"Symbol: {symbol}\n"
         f"Timeframe: {config.timeframe}\n"
         f"Bars (oldest → newest):\n{ohlcv_table}"
-        f"{context}\n\n"
+        f"{context}"
+        f"{position_ctx}\n\n"
         "Provide your trading signal as JSON."
     )
 

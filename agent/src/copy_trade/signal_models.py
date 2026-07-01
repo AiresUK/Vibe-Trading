@@ -31,7 +31,8 @@ class SignalConfig:
     min_confidence: float = 0.65
     risk_per_trade_pct: float = 1.0
     max_positions: int = 5
-    interval_minutes: int | None = None  # None = manual only; set to run automatically
+    interval_minutes: int | None = 15    # minutes between auto-cycles; None = manual only
+    max_trade_hours: int = 48            # auto-close open positions after this many hours
     enabled: bool = True
     label: str = ""
 

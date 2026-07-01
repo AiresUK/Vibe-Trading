@@ -334,6 +334,29 @@ def place_order(
     return _with_profile(profile, result)
 
 
+get_historical_bars = get_history
+
+
+def close_position(
+    position_id: int,
+    profile_id: str | None = None,
+    *,
+    volume: int,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Close an open position by position_id (cTrader and compatible connectors)."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "positions.close")
+    if profile.readonly:
+        return _unsupported(profile, "positions.close")
+    module = _sdk_module(profile.connector)
+    if not hasattr(module, "close_position"):
+        return {"status": "unsupported", "error": f"{profile.connector} does not support close_position"}
+    config = module.build_config(profile.config, overrides)
+    return _with_profile(profile, module.close_position(config, position_id=position_id, volume=volume))
+
+
 def cancel_order(
     order_id: str,
     profile_id: str | None = None,
