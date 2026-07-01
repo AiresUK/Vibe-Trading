@@ -349,3 +349,109 @@ def load_recent_signal_cycles(config_id: str, n: int = 10) -> list[dict[str, Any
         except Exception:
             pass
     return results
+
+
+# ---- Feedback logs: skipped signals and trade outcomes -----------------
+
+_MAX_FEEDBACK_HISTORY = 50
+
+
+def _skipped_signals_path(config_id: str) -> Path:
+    d = _copy_trade_root() / "skipped_signals"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{config_id}.jsonl"
+
+
+def _trade_outcomes_path(config_id: str) -> Path:
+    d = _copy_trade_root() / "trade_outcomes"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{config_id}.jsonl"
+
+
+def save_skipped_signal(
+    config_id: str,
+    symbol: str,
+    direction: str,
+    confidence: float,
+    reason: str,
+) -> None:
+    """Persist a signal that was generated but not acted on."""
+    path = _skipped_signals_path(config_id)
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    record = {
+        "ts": utc_now_iso(),
+        "symbol": symbol,
+        "direction": direction,
+        "confidence": round(confidence, 3),
+        "reason": reason,
+    }
+    lines.append(json.dumps(record, ensure_ascii=False))
+    if len(lines) > _MAX_FEEDBACK_HISTORY:
+        lines = lines[-_MAX_FEEDBACK_HISTORY:]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_recent_skipped_signals(config_id: str, n: int = 20) -> list[dict[str, Any]]:
+    """Return the last ``n`` skipped signals for a config, newest first."""
+    path = _skipped_signals_path(config_id)
+    if not path.exists():
+        return []
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    tail = lines[-n:]
+    results = []
+    for line in reversed(tail):
+        try:
+            results.append(json.loads(line))
+        except Exception:
+            pass
+    return results
+
+
+def save_trade_outcome(
+    config_id: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    pnl_pct: float,
+    duration_h: float,
+    close_reason: str,
+) -> None:
+    """Persist the result of a closed trade so the AI can learn from it."""
+    path = _trade_outcomes_path(config_id)
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    record = {
+        "ts": utc_now_iso(),
+        "symbol": symbol,
+        "side": side,
+        "entry_price": round(entry_price, 5),
+        "exit_price": round(exit_price, 5),
+        "pnl_pct": round(pnl_pct, 3),
+        "duration_h": round(duration_h, 2),
+        "close_reason": close_reason,
+        "outcome": "win" if pnl_pct > 0 else "loss",
+    }
+    lines.append(json.dumps(record, ensure_ascii=False))
+    if len(lines) > _MAX_FEEDBACK_HISTORY:
+        lines = lines[-_MAX_FEEDBACK_HISTORY:]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_recent_trade_outcomes(config_id: str, n: int = 10) -> list[dict[str, Any]]:
+    """Return the last ``n`` closed-trade results for a config, newest first."""
+    path = _trade_outcomes_path(config_id)
+    if not path.exists():
+        return []
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    tail = lines[-n:]
+    results = []
+    for line in reversed(tail):
+        try:
+            results.append(json.loads(line))
+        except Exception:
+            pass
+    return results

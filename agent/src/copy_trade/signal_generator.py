@@ -42,6 +42,13 @@ Rules:
 - position_size_pct: relative to the maximum allowed risk — 100 = full size, \
 50 = half size.  Set to 0 when direction is "hold".
 - Return ONLY the JSON object, no markdown fences, no extra text.
+
+When RECENT TRADE OUTCOMES and RECENT SKIPPED SIGNALS are provided:
+- Use them to calibrate confidence — if this symbol has been losing recently, \
+be more cautious; if wins are consistent, you can be more decisive.
+- If a signal was skipped (low confidence) multiple times but price moved strongly \
+in that direction, raise your confidence appropriately next time.
+- Do not blindly repeat losing patterns — factor in what went wrong.
 """
 
 
@@ -114,6 +121,39 @@ def _parse_signal_json(text: str, symbol: str) -> dict[str, Any] | None:
         return None
 
 
+def _format_feedback_context(config_id: str, symbol: str) -> str:
+    """Build a context block from recent trade outcomes and skipped signals for *symbol*."""
+    try:
+        from src.copy_trade.state import load_recent_skipped_signals, load_recent_trade_outcomes
+    except Exception:
+        return ""
+
+    parts: list[str] = []
+
+    outcomes = [o for o in load_recent_trade_outcomes(config_id, n=20) if o.get("symbol") == symbol][:8]
+    if outcomes:
+        lines = ["RECENT TRADE OUTCOMES for this symbol (newest first):"]
+        for o in outcomes:
+            lines.append(
+                f"  {o['side'].upper()} | {o['outcome'].upper()} | "
+                f"P&L: {o['pnl_pct']:+.2f}% | held {o['duration_h']:.1f}h | "
+                f"reason: {o['close_reason']}"
+            )
+        parts.append("\n".join(lines))
+
+    skipped = [s for s in load_recent_skipped_signals(config_id, n=40) if s.get("symbol") == symbol][:12]
+    if skipped:
+        lines = ["RECENT SKIPPED SIGNALS for this symbol (newest first):"]
+        for s in skipped:
+            lines.append(
+                f"  {s['direction'].upper()} | conf={s['confidence']:.2f} | "
+                f"{s['reason']} | {s['ts'][:16]}"
+            )
+        parts.append("\n".join(lines))
+
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 def generate_signal(
     symbol: str,
     bars_raw: dict[str, Any],
@@ -176,12 +216,15 @@ def generate_signal(
                 "If momentum still favours the original direction, signal that same direction (or 'hold' if unsure)."
             )
 
+    feedback_ctx = _format_feedback_context(config.config_id, symbol)
+
     user_msg = (
         f"Symbol: {symbol}\n"
         f"Timeframe: {config.timeframe}\n"
         f"Bars (oldest → newest):\n{ohlcv_table}"
         f"{context}"
-        f"{position_ctx}\n\n"
+        f"{position_ctx}"
+        f"{feedback_ctx}\n\n"
         "Provide your trading signal as JSON."
     )
 

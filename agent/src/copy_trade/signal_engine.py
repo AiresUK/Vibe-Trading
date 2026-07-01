@@ -29,7 +29,9 @@ from src.copy_trade.state import (
     get_prop_firm_rules,
     load_tracked_positions,
     remove_tracked_position,
+    save_skipped_signal,
     save_tracked_position,
+    save_trade_outcome,
     utc_now_iso,
 )
 from src.trading.service import close_position, get_account, get_historical_bars, get_positions, get_quote, place_order
@@ -157,6 +159,22 @@ def run_signal_cycle(
                         volume=int(pos_info["volume"]),
                     )
                     remove_tracked_position(config.config_id, pid)
+                    # Record outcome — fetch current quote for approximate exit price.
+                    try:
+                        q = get_quote(pos_info["symbol"], config.profile_id)
+                        exit_px = float(next(
+                            (q.get(k) for k in ("last", "price", "close", "bid", "ask") if q.get(k)), 0
+                        ) or 0)
+                        ep = float(pos_info.get("entry_price", 0))
+                        if ep > 0 and exit_px > 0:
+                            raw_pnl = (exit_px - ep) / ep * 100
+                            pnl = raw_pnl if pos_info.get("side") == "buy" else -raw_pnl
+                            save_trade_outcome(
+                                config.config_id, pos_info["symbol"], pos_info.get("side", ""),
+                                ep, exit_px, pnl, age_hours, f"time_exit_{max_hours}h",
+                            )
+                    except Exception:
+                        pass
                 result.orders_placed.append({
                     "symbol": pos_info["symbol"],
                     "side": "close",
@@ -254,6 +272,21 @@ def run_signal_cycle(
                             volume=int(pos_info["volume"]),
                         )
                         remove_tracked_position(config.config_id, pid)
+                        # Record outcome using the current signal price as exit.
+                        ep = float(pos_info.get("entry_price", 0))
+                        if ep > 0 and sig.current_price > 0:
+                            raw_pnl = (sig.current_price - ep) / ep * 100
+                            pnl = raw_pnl if tracked_side == "buy" else -raw_pnl
+                            try:
+                                entry_dt2 = datetime.fromisoformat(pos_info.get("entry_time", ""))
+                                dur_h = (now_dt - entry_dt2).total_seconds() / 3600
+                            except Exception:
+                                dur_h = 0.0
+                            save_trade_outcome(
+                                config.config_id, sig.symbol, tracked_side,
+                                ep, sig.current_price, pnl, dur_h,
+                                f"reversal_{sig.direction}",
+                            )
                     result.orders_placed.append({
                         "symbol": sig.symbol,
                         "side": "close",
@@ -393,12 +426,14 @@ def run_signal_cycle(
     # Skip-record signals that were held back by the position cap.
     cap_skipped = all_buys[available_slots:]
     for sig in cap_skipped:
+        reason = "max_positions cap reached"
         result.orders_skipped.append({
             "symbol": sig.symbol,
             "direction": sig.direction,
             "confidence": sig.confidence,
-            "reason": "max_positions cap reached",
+            "reason": reason,
         })
+        save_skipped_signal(config.config_id, sig.symbol, sig.direction, sig.confidence, reason)
 
     # Record holds / low-confidence skips.
     low_conf = [
@@ -406,12 +441,14 @@ def run_signal_cycle(
         if s.direction in ("buy", "sell") and s.confidence < config.min_confidence
     ]
     for sig in low_conf:
+        reason = f"confidence {sig.confidence:.2f} < min {config.min_confidence:.2f}"
         result.orders_skipped.append({
             "symbol": sig.symbol,
             "direction": sig.direction,
             "confidence": sig.confidence,
-            "reason": f"confidence {sig.confidence:.2f} < min {config.min_confidence:.2f}",
+            "reason": reason,
         })
+        save_skipped_signal(config.config_id, sig.symbol, sig.direction, sig.confidence, reason)
 
     # 6. Snapshot equity after.
     if not dry_run:
