@@ -28,9 +28,9 @@ class SignalConfig:
     watchlist: list[str] = field(default_factory=list)
     timeframe: str = "1h"
     lookback_bars: int = 50
-    min_confidence: float = 0.65
-    risk_per_trade_pct: float = 1.0
-    max_positions: int = 5
+    min_confidence: float = 0.75
+    risk_per_trade_pct: float = 0.5
+    max_positions: int = 3
     interval_minutes: int | None = 15    # minutes between auto-cycles; None = manual only
     max_trade_hours: int = 48            # auto-close open positions after this many hours
     enabled: bool = True

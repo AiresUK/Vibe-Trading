@@ -88,8 +88,8 @@ class PropFirmRules:
     daily_drawdown_limit_pct: float = 5.0
     total_drawdown_limit_pct: float = 10.0
     profit_target_pct: float = 10.0
-    alert_pct: float = 80.0
-    halt_pct: float = 95.0
+    alert_pct: float = 50.0
+    halt_pct: float = 70.0
     enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
