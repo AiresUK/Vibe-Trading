@@ -103,10 +103,12 @@ class _SignalSchedulerDaemon:
         configs = load_all_signal_configs()
         now = _utc_now()
 
-        # Skip everything if forex market is closed (weekend).
-        from src.copy_trade.market_hours import is_market_open
+        from src.copy_trade.market_hours import is_market_open, is_sunday_preopen
         market_open, _ = is_market_open(now)
-        if not market_open:
+        sunday_preopen = is_sunday_preopen(now)
+
+        # Friday night / Saturday — fully idle, nothing to do.
+        if not market_open and not sunday_preopen:
             return
 
         for config in configs.values():
@@ -114,13 +116,15 @@ class _SignalSchedulerDaemon:
                 continue
 
             # --- Fast news check (every news_check_interval_minutes, default 5 min) ---
+            # Runs on Sunday pre-open too so we know what's coming at 22:00 UTC.
             if getattr(config, "news_filter_enabled", True):
                 news_interval_s = getattr(config, "news_check_interval_minutes", 5) * 60
                 last_check = _last_news_check.get(config.config_id)
                 if last_check is None or (now - last_check).total_seconds() >= news_interval_s:
                     _last_news_check[config.config_id] = now
                     try:
-                        _run_news_check(config)
+                        # scan_only=True on Sunday: log alerts but don't try to close positions
+                        _run_news_check(config, scan_only=not market_open)
                     except Exception as exc:
                         logger.error(
                             "[signal_scheduler] news check failed for %s: %s",
@@ -128,6 +132,9 @@ class _SignalSchedulerDaemon:
                         )
 
             # --- Full signal cycle (every interval_minutes, default 15 min) ---
+            # Only runs when the market is actually open.
+            if not market_open:
+                continue
             if not config.interval_minutes:
                 continue
             if not _is_due(config.config_id, config.interval_minutes):
@@ -152,22 +159,37 @@ class _SignalSchedulerDaemon:
 _last_news_check: dict[str, datetime] = {}
 
 
-def _run_news_check(config: Any) -> None:
-    """Close all tracked positions immediately if a high-impact event is near."""
+def _run_news_check(config: Any, *, scan_only: bool = False) -> None:
+    """Check for high-impact news and act accordingly.
+
+    When *scan_only* is True (e.g. Sunday pre-open) the function logs any
+    upcoming events but does NOT attempt to close positions — the market is
+    not yet open so the broker would reject close requests anyway.
+    """
     from src.copy_trade.news_filter import is_news_blackout
     from src.copy_trade.state import load_tracked_positions, remove_tracked_position
     from src.trading.service import close_position
 
     blackout_minutes = getattr(config, "news_blackout_minutes", 30)
     in_blackout, reason = is_news_blackout(_utc_now(), blackout_minutes)
+
     if not in_blackout:
+        return
+
+    label = config.label or config.config_id
+
+    if scan_only:
+        logger.info(
+            "[signal_scheduler] Sunday pre-open NEWS ALERT for %s — %s "
+            "(will trade cautiously at open)",
+            label, reason,
+        )
         return
 
     tracked = load_tracked_positions(config.config_id)
     if not tracked:
         return
 
-    label = config.label or config.config_id
     logger.warning(
         "[signal_scheduler] NEWS BLACKOUT — closing %d open position(s) for %s: %s",
         len(tracked), label, reason,
