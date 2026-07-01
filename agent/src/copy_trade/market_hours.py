@@ -32,3 +32,12 @@ def is_market_open(now_utc: datetime | None = None) -> tuple[bool, str]:
         return False, f"Forex closed — Sunday open in ~{hours_left}h (22:00 UTC)"
 
     return True, ""
+
+
+def is_sunday_preopen(now_utc: datetime | None = None) -> bool:
+    """Return True if it is Sunday before 22:00 UTC (market not yet open)."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    return now_utc.weekday() == 6 and now_utc.hour < 22
