@@ -113,8 +113,24 @@ def run_signal_cycle(
             alert_msgs = [c.message for c in pf_check.checks if c.status in ("alert", "target_reached")]
             logger.info("[signal] PROP FIRM ALERT config=%s: %s", config.config_id, alert_msgs)
 
-    # 3. Time-based exit — close positions older than max_trade_hours.
+    # 3. News filter — skip entire cycle if near a high-impact economic release.
     now_dt = datetime.now(timezone.utc)
+    if getattr(config, "news_filter_enabled", True):
+        from src.copy_trade.news_filter import is_news_blackout
+        in_blackout, blackout_reason = is_news_blackout(
+            now_dt, blackout_minutes=getattr(config, "news_blackout_minutes", 30)
+        )
+        if in_blackout:
+            logger.info("[signal] NEWS BLACKOUT — skipping cycle: %s", blackout_reason)
+            result.errors.append({
+                "symbol": "*",
+                "error": f"News blackout: {blackout_reason}",
+                "news_blackout": True,
+            })
+            append_signal_cycle_result(result)
+            return result
+
+    # 4. Time-based exit — close positions older than max_trade_hours.
     max_hours = getattr(config, "max_trade_hours", 48)
     tracked = load_tracked_positions(config.config_id)
     for pid, pos_info in list(tracked.items()):

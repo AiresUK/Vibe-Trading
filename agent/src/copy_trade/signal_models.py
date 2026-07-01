@@ -33,6 +33,8 @@ class SignalConfig:
     max_positions: int = 3
     interval_minutes: int | None = 15    # minutes between auto-cycles; None = manual only
     max_trade_hours: int = 48            # auto-close open positions after this many hours
+    news_filter_enabled: bool = True     # pause trading around high-impact news events
+    news_blackout_minutes: int = 30      # minutes before and after news to pause
     enabled: bool = True
     label: str = ""
 
