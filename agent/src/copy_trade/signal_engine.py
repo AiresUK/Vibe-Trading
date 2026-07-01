@@ -31,6 +31,30 @@ from src.trading.service import get_account, get_historical_bars, get_positions,
 
 logger = logging.getLogger(__name__)
 
+_ATR_PERIOD = 14
+_SL_ATR_MULTIPLE = 2.0   # stop loss = 2× ATR from entry
+_TP_ATR_MULTIPLE = 3.0   # take profit = 3× ATR (1:1.5 R:R) — bonus target only
+
+
+def _compute_atr(bars_raw: dict, period: int = _ATR_PERIOD) -> float | None:
+    """Approximate ATR from raw bars dict returned by get_historical_bars."""
+    bars = bars_raw.get("bars", [])
+    if len(bars) < 2:
+        return None
+    true_ranges: list[float] = []
+    for i in range(1, len(bars)):
+        high = float(bars[i].get("high", 0))
+        low = float(bars[i].get("low", 0))
+        prev_close = float(bars[i - 1].get("close", 0))
+        if high == 0 or low == 0:
+            continue
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+    if not true_ranges:
+        return None
+    recent = true_ranges[-period:]
+    return sum(recent) / len(recent)
+
 
 def run_signal_cycle(
     config: SignalConfig,
@@ -91,8 +115,9 @@ def run_signal_cycle(
     except Exception as exc:
         logger.debug("[signal] Could not read positions: %s", exc)
 
-    # 4. Generate signals for each symbol.
+    # 4. Generate signals for each symbol — keep bars for ATR-based SL/TP later.
     signals: list[Signal] = []
+    bars_by_symbol: dict[str, dict] = {}
     for symbol in config.watchlist:
         try:
             bars_raw = get_historical_bars(
@@ -105,6 +130,8 @@ def run_signal_cycle(
             logger.warning("[signal] Could not fetch bars for %s: %s", symbol, exc)
             result.errors.append({"symbol": symbol, "error": f"bars fetch failed: {exc}"})
             bars_raw = {}
+
+        bars_by_symbol[symbol] = bars_raw
 
         try:
             quote_raw = get_quote(symbol, config.profile_id)
@@ -157,18 +184,38 @@ def run_signal_cycle(
             logger.info("[signal] %s %s skipped — qty too small", sig.direction.upper(), sig.symbol)
             continue
 
+        # Compute ATR-based stop loss (2× ATR) and take profit (3× ATR bonus).
+        stop_loss: float | None = None
+        take_profit: float | None = None
+        atr = _compute_atr(bars_by_symbol.get(sig.symbol, {}))
+        if atr and sig.current_price > 0:
+            sl_dist = round(_SL_ATR_MULTIPLE * atr, 5)
+            tp_dist = round(_TP_ATR_MULTIPLE * atr, 5)
+            if sig.direction == "buy":
+                stop_loss = round(sig.current_price - sl_dist, 5)
+                take_profit = round(sig.current_price + tp_dist, 5)
+            else:
+                stop_loss = round(sig.current_price + sl_dist, 5)
+                take_profit = round(sig.current_price - tp_dist, 5)
+            logger.info(
+                "[signal] %s %s SL=%.5f TP=%.5f (ATR=%.5f)",
+                sig.direction.upper(), sig.symbol, stop_loss, take_profit, atr,
+            )
+
         if dry_run:
             result.orders_placed.append({
                 "symbol": sig.symbol,
                 "side": sig.direction,
                 "quantity": qty,
                 "confidence": sig.confidence,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
                 "status": "dry_run",
                 "reasoning": sig.reasoning,
             })
             logger.info(
-                "[signal][DRY RUN] Would %s %.4f %s (conf=%.2f)",
-                sig.direction.upper(), qty, sig.symbol, sig.confidence,
+                "[signal][DRY RUN] Would %s %.4f %s (conf=%.2f) SL=%s TP=%s",
+                sig.direction.upper(), qty, sig.symbol, sig.confidence, stop_loss, take_profit,
             )
             continue
 
@@ -179,6 +226,8 @@ def run_signal_cycle(
                 side=sig.direction,
                 quantity=qty,
                 order_type="market",
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 session_id=session_id,
             )
             result.orders_placed.append(

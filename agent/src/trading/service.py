@@ -274,6 +274,8 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -301,6 +303,8 @@ def place_order(
         "order_type": order_type,
         "limit_price": limit_price,
         "time_in_force": time_in_force,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
     }
 
     if profile.environment == "paper":

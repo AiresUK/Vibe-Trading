@@ -469,11 +469,21 @@ class _TrendbarsRequest(_RequestHandler):
 
 
 class _NewOrderRequest(_RequestHandler):
-    def __init__(self, account_id: int, symbol_id: int, side: int, volume: int) -> None:
+    def __init__(
+        self,
+        account_id: int,
+        symbol_id: int,
+        side: int,
+        volume: int,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> None:
         self._account_id = account_id
         self._symbol_id = symbol_id
         self._side = side
         self._volume = volume
+        self._stop_loss = stop_loss
+        self._take_profit = take_profit
 
     def _send(self, client: Any) -> None:
         from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
@@ -485,6 +495,10 @@ class _NewOrderRequest(_RequestHandler):
         req.tradeSide = self._side
         req.volume = self._volume
         req.comment = "vibe-trading"
+        if self._stop_loss is not None:
+            req.stopLoss = self._stop_loss
+        if self._take_profit is not None:
+            req.takeProfit = self._take_profit
         client.send(req)
 
     def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
@@ -688,31 +702,43 @@ def get_historical_bars(
 
 
 def place_order(
-    symbol: str,
     config: CTraderConfig,
+    *,
+    symbol: str,
     side: str,
-    quantity: float,
+    quantity: float | None = None,
     order_type: str = "market",
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOATradeSide
 
+    qty = float(quantity or 0)
     symbol_id = _get_symbol_id(symbol, config)
     trade_side = ProtoOATradeSide.Value("BUY" if side.lower() == "buy" else "SELL")
     # Convert lots to cTrader volume units (1 standard lot = 100,000 units)
-    volume = max(1000, int(round(quantity * 100000)))
+    volume = max(1000, int(round(qty * 100000)))
 
-    res = _execute(config, _NewOrderRequest(config.account_id, symbol_id, trade_side, volume))
-    return {
+    res = _execute(
+        config,
+        _NewOrderRequest(config.account_id, symbol_id, trade_side, volume, stop_loss, take_profit),
+    )
+    result: dict[str, Any] = {
         "symbol": symbol,
         "side": side,
-        "quantity": quantity,
+        "quantity": qty,
         "volume": volume,
         "execution_type": res.executionType,
         "order_id": res.order.orderId if res.HasField("order") else None,
         "position_id": res.position.positionId if res.HasField("position") else None,
         "status": "placed",
     }
+    if stop_loss is not None:
+        result["stop_loss"] = stop_loss
+    if take_profit is not None:
+        result["take_profit"] = take_profit
+    return result
 
 
 def cancel_order(order_id: str, config: CTraderConfig, **kwargs: Any) -> dict[str, Any]:
