@@ -101,9 +101,27 @@ class _SignalSchedulerDaemon:
         from src.copy_trade.state import load_all_signal_configs
 
         configs = load_all_signal_configs()
+        now = _utc_now()
+
         for config in configs.values():
             if not config.enabled:
                 continue
+
+            # --- Fast news check (every news_check_interval_minutes, default 5 min) ---
+            if getattr(config, "news_filter_enabled", True):
+                news_interval_s = getattr(config, "news_check_interval_minutes", 5) * 60
+                last_check = _last_news_check.get(config.config_id)
+                if last_check is None or (now - last_check).total_seconds() >= news_interval_s:
+                    _last_news_check[config.config_id] = now
+                    try:
+                        _run_news_check(config)
+                    except Exception as exc:
+                        logger.error(
+                            "[signal_scheduler] news check failed for %s: %s",
+                            config.config_id, exc,
+                        )
+
+            # --- Full signal cycle (every interval_minutes, default 15 min) ---
             if not config.interval_minutes:
                 continue
             if not _is_due(config.config_id, config.interval_minutes):
@@ -122,6 +140,48 @@ class _SignalSchedulerDaemon:
                 )
             except Exception as exc:
                 logger.error("[signal_scheduler] cycle failed for %s: %s", label, exc)
+
+
+# Per-config last-news-check timestamps (populated by the daemon).
+_last_news_check: dict[str, datetime] = {}
+
+
+def _run_news_check(config: Any) -> None:
+    """Close all tracked positions immediately if a high-impact event is near."""
+    from src.copy_trade.news_filter import is_news_blackout
+    from src.copy_trade.state import load_tracked_positions, remove_tracked_position
+    from src.trading.service import close_position
+
+    blackout_minutes = getattr(config, "news_blackout_minutes", 30)
+    in_blackout, reason = is_news_blackout(_utc_now(), blackout_minutes)
+    if not in_blackout:
+        return
+
+    tracked = load_tracked_positions(config.config_id)
+    if not tracked:
+        return
+
+    label = config.label or config.config_id
+    logger.warning(
+        "[signal_scheduler] NEWS BLACKOUT — closing %d open position(s) for %s: %s",
+        len(tracked), label, reason,
+    )
+    for pid, pos_info in list(tracked.items()):
+        try:
+            close_position(
+                int(pos_info["position_id"]),
+                config.profile_id,
+                volume=int(pos_info["volume"]),
+            )
+            remove_tracked_position(config.config_id, pid)
+            logger.info(
+                "[signal_scheduler] Closed %s %s (pos %s) — news",
+                pos_info.get("side", "").upper(), pos_info.get("symbol", ""), pid,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[signal_scheduler] Could not close position %s for news: %s", pid, exc,
+            )
 
 
 # Module-level singleton.
