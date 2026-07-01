@@ -67,6 +67,12 @@ class CTraderConfigError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+_CTRADER_TOKEN_URL = "https://connect.ctrader.com/oauth/token"
+
+# In-memory cache: account_id → last refresh-check datetime (avoids checking every call).
+_refresh_check_cache: dict[int, "datetime"] = {}
+
+
 @dataclass(frozen=True)
 class CTraderConfig:
     """cTrader connector credentials and settings.
@@ -75,6 +81,8 @@ class CTraderConfig:
         client_id: Open API application client id (from connect.ctrader.com).
         client_secret: Open API application client secret.
         access_token: OAuth2 access token for the specific cTrader account.
+        refresh_token: OAuth2 refresh token used to obtain new access tokens.
+        token_expires_at: ISO-8601 UTC datetime when the access token expires.
         account_id: Numeric cTrader account id.
         environment: ``"demo"`` or ``"live"``.
         timeout: Per-request timeout in seconds.
@@ -83,6 +91,8 @@ class CTraderConfig:
     client_id: str = ""
     client_secret: str = ""
     access_token: str = ""
+    refresh_token: str = ""
+    token_expires_at: str = ""
     account_id: int = 0
     environment: str = "demo"
     timeout: int = 30
@@ -112,6 +122,93 @@ def save_config(config: CTraderConfig) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
     return path
+
+
+def refresh_access_token(config: CTraderConfig) -> CTraderConfig:
+    """Exchange the stored refresh_token for a fresh access_token and persist it."""
+    import urllib.parse
+    import urllib.request
+
+    from datetime import datetime, timedelta, timezone
+
+    if not config.refresh_token:
+        raise CTraderConfigError("No refresh_token in ctrader.json — cannot auto-refresh.")
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": config.refresh_token,
+        "client_id": config.client_id,
+        "client_secret": config.client_secret,
+    }).encode()
+
+    req = urllib.request.Request(
+        _CTRADER_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+
+    expires_in = int(data.get("expires_in", 2628000))
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(timespec="seconds")
+
+    new_config = CTraderConfig(
+        client_id=config.client_id,
+        client_secret=config.client_secret,
+        access_token=data["access_token"],
+        refresh_token=data.get("refresh_token", config.refresh_token),
+        token_expires_at=expires_at,
+        account_id=config.account_id,
+        environment=config.environment,
+        timeout=config.timeout,
+    )
+    save_config(new_config)
+    logger.info("[ctrader] Token refreshed — expires %s", expires_at)
+    return new_config
+
+
+def _maybe_refresh_token(config: CTraderConfig) -> CTraderConfig:
+    """Return config with a fresh token if the current one expires within 7 days.
+
+    Checks at most once per hour (in-memory cache) to avoid slowing every call.
+    Falls back to the existing token on any error so the bot keeps running.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if not config.refresh_token:
+        return config
+
+    now = datetime.now(timezone.utc)
+    last_check = _refresh_check_cache.get(config.account_id)
+    if last_check and (now - last_check).total_seconds() < 3600:
+        return config  # already checked within the last hour
+
+    _refresh_check_cache[config.account_id] = now
+
+    should_refresh = False
+    if not config.token_expires_at:
+        should_refresh = True
+    else:
+        try:
+            expires_at = datetime.fromisoformat(config.token_expires_at)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            days_left = (expires_at - now).days
+            if days_left < 7:
+                logger.info("[ctrader] Token expires in %d day(s) — refreshing", days_left)
+                should_refresh = True
+        except (ValueError, TypeError):
+            should_refresh = True
+
+    if not should_refresh:
+        return config
+
+    try:
+        return refresh_access_token(config)
+    except Exception as exc:
+        logger.warning("[ctrader] Token auto-refresh failed: %s — using existing token", exc)
+        return config
 
 
 def build_config(profile_config: Mapping[str, Any], overrides: Mapping[str, Any] | None = None) -> CTraderConfig:
@@ -171,6 +268,7 @@ def _execute(
     It should call ``put_result(value)`` with the parsed response or
     ``put_result(Exception(...))`` on error.
     """
+    config = _maybe_refresh_token(config)
     _check_dependency()
     _ensure_reactor()
 

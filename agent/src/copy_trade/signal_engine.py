@@ -113,8 +113,17 @@ def run_signal_cycle(
             alert_msgs = [c.message for c in pf_check.checks if c.status in ("alert", "target_reached")]
             logger.info("[signal] PROP FIRM ALERT config=%s: %s", config.config_id, alert_msgs)
 
-    # 3. News filter — skip entire cycle if near a high-impact economic release.
+    # 3. Market hours guard — skip if forex is closed (weekend).
     now_dt = datetime.now(timezone.utc)
+    from src.copy_trade.market_hours import is_market_open
+    market_open, market_closed_reason = is_market_open(now_dt)
+    if not market_open:
+        logger.info("[signal] Market closed — skipping cycle: %s", market_closed_reason)
+        result.errors.append({"symbol": "*", "error": market_closed_reason, "market_closed": True})
+        append_signal_cycle_result(result)
+        return result
+
+    # 4. News filter — skip entire cycle if near a high-impact economic release.
     if getattr(config, "news_filter_enabled", True):
         from src.copy_trade.news_filter import is_news_blackout
         in_blackout, blackout_reason = is_news_blackout(

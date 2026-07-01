@@ -103,6 +103,12 @@ class _SignalSchedulerDaemon:
         configs = load_all_signal_configs()
         now = _utc_now()
 
+        # Skip everything if forex market is closed (weekend).
+        from src.copy_trade.market_hours import is_market_open
+        market_open, _ = is_market_open(now)
+        if not market_open:
+            return
+
         for config in configs.values():
             if not config.enabled:
                 continue
