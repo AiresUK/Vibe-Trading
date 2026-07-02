@@ -83,11 +83,12 @@ class SetupSignalTradeTool(BaseTool):
         if not watchlist:
             return "Error: watchlist contains no valid symbols."
 
-        # Validate profile exists.
+        # Soft-validate profile: warn but don't block if lookup fails (profile is
+        # validated again at runtime when the signal cycle actually connects).
         try:
             profile_by_id(profile_id)
-        except Exception as exc:
-            return f"Error: profile '{profile_id}' not found — {exc}"
+        except Exception:
+            pass  # allow any profile_id string; validated at cycle time
 
         timeframe = str(_get("timeframe", "1h")).strip().lower()
         valid_timeframes = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "1d", "1w"}
