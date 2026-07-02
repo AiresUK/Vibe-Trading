@@ -337,6 +337,25 @@ def _execute(
                     _safe_stop(client)
 
             def on_connected(client: Any) -> None:
+                # Patch client.send so every deferred gets an errback that
+                # silently absorbs the 5-second SDK-internal timeout cleanup.
+                # When _safe_stop() closes the connection, pending deferreds
+                # are cancelled; without this they spew TimeoutError to stderr.
+                _orig_send = client.send
+
+                def _patched_send(*a: Any, **kw: Any) -> Any:
+                    d = _orig_send(*a, **kw)
+                    if d is not None:
+                        try:
+                            from twisted.internet import defer as _defer
+                            d.addErrback(
+                                lambda f: f.trap(_defer.TimeoutError, _defer.CancelledError)
+                            )
+                        except Exception:
+                            pass
+                    return d
+
+                client.send = _patched_send
                 client_holder.append(client)
                 phase[0] = "app_auth"
                 req = ProtoOAApplicationAuthReq()
@@ -497,6 +516,21 @@ def _execute_app_only(
                     _safe_stop(client)
 
             def on_connected(client: Any) -> None:
+                _orig_send = client.send
+
+                def _patched_send(*a: Any, **kw: Any) -> Any:
+                    d = _orig_send(*a, **kw)
+                    if d is not None:
+                        try:
+                            from twisted.internet import defer as _defer
+                            d.addErrback(
+                                lambda f: f.trap(_defer.TimeoutError, _defer.CancelledError)
+                            )
+                        except Exception:
+                            pass
+                    return d
+
+                client.send = _patched_send
                 phase[0] = "app_auth"
                 req = ProtoOAApplicationAuthReq()
                 req.clientId = config.client_id
