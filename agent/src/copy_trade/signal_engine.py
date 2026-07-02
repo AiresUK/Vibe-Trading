@@ -88,11 +88,13 @@ def run_signal_cycle(
     try:
         acct = get_account(config.profile_id)
         equity, balance = _extract_equity(acct)
-        # Fall back to balance if equity field is missing from broker response.
-        if equity is None and balance is not None:
+        # Fall back to balance when equity field is missing OR returned as zero.
+        if (equity is None or equity == 0) and balance is not None and balance > 0:
             equity = balance
             logger.debug("[signal] Using balance as equity fallback: %.2f", equity)
         result.equity_before = equity
+        logger.info("[signal] Account equity=%.2f balance=%.2f profile=%s",
+                    equity or 0, balance or 0, config.profile_id)
     except Exception as exc:
         logger.warning("[signal] Could not read equity (profile=%s): %s", config.profile_id, exc)
         result.errors.append({"symbol": "*", "error": f"account fetch failed: {exc}"})
@@ -329,23 +331,45 @@ def run_signal_cycle(
         _time.sleep(1.5)
 
         # Compute order quantity from equity risk.
+        # Use sig.current_price; fall back to most-recent bar close if the
+        # live quote wasn't available (spot subscription returning bid=0).
+        effective_price = sig.current_price
+        if effective_price <= 0:
+            for bar in reversed(bars_by_symbol.get(sig.symbol, {}).get("bars", [])):
+                try:
+                    v = float(bar.get("close") or 0)
+                    if v > 0:
+                        effective_price = v
+                        logger.info("[signal] %s price fallback from bar close: %.5f", sig.symbol, v)
+                        break
+                except (TypeError, ValueError):
+                    pass
+
         qty = 0.0
-        if sig.current_price > 0 and equity is not None and equity > 0:
-            risk_notional = equity * (config.risk_per_trade_pct / 100.0) * (sig.position_size_pct / 100.0)
-            qty = risk_notional / sig.current_price
+        effective_equity = equity if (equity is not None and equity > 0) else 0.0
+        if effective_price > 0 and effective_equity > 0:
+            risk_notional = effective_equity * (config.risk_per_trade_pct / 100.0) * (sig.position_size_pct / 100.0)
+            qty = risk_notional / effective_price
             qty = round(qty, 8)
 
         if qty < MIN_QTY_THRESHOLD:
-            why = "equity unavailable" if equity is None else f"price={sig.current_price:.5f}"
+            if effective_equity <= 0:
+                why = f"equity={equity} (balance fallback failed)"
+            elif effective_price <= 0:
+                why = "price=0 (quote and bar close both unavailable)"
+            else:
+                why = (f"qty={qty:.8f} tiny — equity={effective_equity:.2f}, "
+                       f"price={effective_price:.5f}, risk={config.risk_per_trade_pct}%, "
+                       f"size={sig.position_size_pct:.0f}%")
             result.orders_skipped.append({
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "confidence": sig.confidence,
-                "reason": f"qty={qty:.4f} below minimum — {why}",
+                "reason": why,
             })
             logger.warning(
-                "[signal] %s %s skipped — qty=%.4f (%s)",
-                sig.direction.upper(), sig.symbol, qty, why,
+                "[signal] %s %s skipped — %s",
+                sig.direction.upper(), sig.symbol, why,
             )
             continue
 

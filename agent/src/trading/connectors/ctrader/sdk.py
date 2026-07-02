@@ -1008,6 +1008,8 @@ def get_quote(symbol: str, config: CTraderConfig) -> dict[str, Any]:
     bid = evt.bid / 100000.0 if evt.bid else 0.0
     ask = evt.ask / 100000.0 if evt.ask else 0.0
     mid = (bid + ask) / 2 if bid and ask else (bid or ask)
+    if mid == 0.0:
+        raise RuntimeError(f"cTrader quote for {symbol} returned bid=0/ask=0 (no tick yet)")
     return {
         "symbol": symbol,
         "bid": bid,
