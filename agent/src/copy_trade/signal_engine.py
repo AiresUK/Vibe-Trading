@@ -87,10 +87,15 @@ def run_signal_cycle(
     equity: float | None = None
     try:
         acct = get_account(config.profile_id)
-        equity, _ = _extract_equity(acct)
+        equity, balance = _extract_equity(acct)
+        # Fall back to balance if equity field is missing from broker response.
+        if equity is None and balance is not None:
+            equity = balance
+            logger.debug("[signal] Using balance as equity fallback: %.2f", equity)
         result.equity_before = equity
     except Exception as exc:
-        logger.debug("[signal] Could not read equity: %s", exc)
+        logger.warning("[signal] Could not read equity (profile=%s): %s", config.profile_id, exc)
+        result.errors.append({"symbol": "*", "error": f"account fetch failed: {exc}"})
 
     # 2. Prop firm rule check — halt before generating any signals.
     pf_rules = get_prop_firm_rules(config.config_id)
@@ -331,13 +336,17 @@ def run_signal_cycle(
             qty = round(qty, 8)
 
         if qty < MIN_QTY_THRESHOLD:
+            why = "equity unavailable" if equity is None else f"price={sig.current_price:.5f}"
             result.orders_skipped.append({
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "confidence": sig.confidence,
-                "reason": "quantity below minimum (price or equity unavailable)",
+                "reason": f"qty={qty:.4f} below minimum — {why}",
             })
-            logger.info("[signal] %s %s skipped — qty too small", sig.direction.upper(), sig.symbol)
+            logger.warning(
+                "[signal] %s %s skipped — qty=%.4f (%s)",
+                sig.direction.upper(), sig.symbol, qty, why,
+            )
             continue
 
         # Compute ATR-based SL and single TP (3×ATR) — one order per signal.
