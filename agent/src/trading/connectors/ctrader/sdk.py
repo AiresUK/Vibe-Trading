@@ -236,19 +236,21 @@ def _install_twisted_log_filter() -> None:
         return
     _twisted_observer_installed = True
     try:
-        from twisted.python import log as twisted_log
+        import twisted.python.log as _tl
 
-        def _observer(event: dict) -> None:
-            if event.get("isError") and event.get("failure"):
-                failure = event["failure"]
-                if failure.type.__name__ in ("TimeoutError", "CancelledError",
-                                              "ConnectionDone", "ConnectionLost"):
-                    return  # suppress noisy cleanup errors
-            msg = twisted_log.textFromEventDict(event)
-            if msg:
-                logger.debug("[twisted] %s", msg.strip())
+        _orig_err = _tl.err
 
-        twisted_log.addObserver(_observer)
+        def _filtered_err(*args: Any, **kwargs: Any) -> None:
+            try:
+                failure = args[0] if args else kwargs.get("_failure") or kwargs.get("failure")
+                type_name = getattr(getattr(failure, "type", None), "__name__", "")
+                if type_name in ("TimeoutError", "CancelledError", "ConnectionDone", "ConnectionLost"):
+                    return
+            except Exception:
+                pass
+            _orig_err(*args, **kwargs)
+
+        _tl.err = _filtered_err
     except Exception:
         pass
 
