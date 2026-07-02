@@ -585,7 +585,7 @@ class _NewOrderRequest(_RequestHandler):
 
     def _send(self, client: Any) -> None:
         from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
-        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOAOrderType
+        from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOAOrderType
         req = ProtoOANewOrderReq()
         req.ctidTraderAccountId = self._account_id
         req.symbolId = self._symbol_id
@@ -703,7 +703,7 @@ _PERIOD_MAP = {
 
 
 def _period_to_ctrader(period: str) -> int:
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOATrendbarPeriod
+    from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOATrendbarPeriod
     name = _PERIOD_MAP.get(period.lower(), "H1")
     return ProtoOATrendbarPeriod.Value(name)
 
@@ -833,7 +833,7 @@ def place_order(
     take_profit: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoOATradeSide
+    from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOATradeSide
 
     qty = float(quantity or 0)
     symbol_id = _get_symbol_id(symbol, config)
