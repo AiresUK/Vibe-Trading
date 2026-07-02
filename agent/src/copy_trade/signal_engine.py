@@ -202,9 +202,11 @@ def run_signal_cycle(
         logger.debug("[signal] Could not read positions: %s", exc)
 
     # 4. Generate signals for each symbol — keep bars for ATR-based SL/TP later.
+    import time as _time_fetch
     signals: list[Signal] = []
     bars_by_symbol: dict[str, dict] = {}
     for symbol in config.watchlist:
+        _time_fetch.sleep(0.5)  # brief pause between symbols to avoid connection bursts
         try:
             bars_raw = get_historical_bars(
                 symbol,
@@ -312,8 +314,15 @@ def run_signal_cycle(
     if not dry_run:
         tracked = load_tracked_positions(config.config_id)
 
-    # 6. Place orders (dual TP: 50% at TP1=1.5×ATR, 50% at TP2=3×ATR, same SL=2×ATR).
+    # 6. Place orders — single order per signal with SL=2×ATR, TP=3×ATR.
+    # One connection per order keeps us well below cTrader's rate limit
+    # (the cycle already opens ~9 connections for bars/quotes/account).
+    import time as _time
+
     for sig in to_execute:
+        # Pause between orders to avoid hitting cTrader connection rate limits.
+        _time.sleep(1.5)
+
         # Compute order quantity from equity risk.
         qty = 0.0
         if sig.current_price > 0 and equity is not None and equity > 0:
@@ -331,32 +340,26 @@ def run_signal_cycle(
             logger.info("[signal] %s %s skipped — qty too small", sig.direction.upper(), sig.symbol)
             continue
 
-        # Compute ATR-based SL and dual TPs; split position into two half-sized orders.
+        # Compute ATR-based SL and single TP (3×ATR) — one order per signal.
         atr = _compute_atr(bars_by_symbol.get(sig.symbol, {}))
-        orders_to_place: list[dict] = []
         if atr and sig.current_price > 0:
             sl_dist = round(_SL_ATR_MULTIPLE * atr, 5)
-            tp1_dist = round(_TP1_ATR_MULTIPLE * atr, 5)
-            tp2_dist = round(_TP2_ATR_MULTIPLE * atr, 5)
+            tp_dist = round(_TP2_ATR_MULTIPLE * atr, 5)
             if sig.direction == "buy":
                 sl = round(sig.current_price - sl_dist, 5)
-                tp1 = round(sig.current_price + tp1_dist, 5)
-                tp2 = round(sig.current_price + tp2_dist, 5)
+                tp = round(sig.current_price + tp_dist, 5)
             else:
                 sl = round(sig.current_price + sl_dist, 5)
-                tp1 = round(sig.current_price - tp1_dist, 5)
-                tp2 = round(sig.current_price - tp2_dist, 5)
-            half_qty = round(qty / 2, 8)
-            orders_to_place = [
-                {"qty": half_qty, "stop_loss": sl, "take_profit": tp1, "tp_label": "TP1"},
-                {"qty": half_qty, "stop_loss": sl, "take_profit": tp2, "tp_label": "TP2"},
-            ]
+                tp = round(sig.current_price - tp_dist, 5)
             logger.info(
-                "[signal] %s %s SL=%.5f TP1=%.5f TP2=%.5f (ATR=%.5f)",
-                sig.direction.upper(), sig.symbol, sl, tp1, tp2, atr,
+                "[signal] %s %s SL=%.5f TP=%.5f (ATR=%.5f)",
+                sig.direction.upper(), sig.symbol, sl, tp, atr,
             )
         else:
-            orders_to_place = [{"qty": qty, "stop_loss": None, "take_profit": None, "tp_label": ""}]
+            sl = None
+            tp = None
+
+        orders_to_place = [{"qty": qty, "stop_loss": sl, "take_profit": tp, "tp_label": "TP"}]
 
         for order_spec in orders_to_place:
             o_qty = order_spec["qty"]
