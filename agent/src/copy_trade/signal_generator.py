@@ -191,6 +191,16 @@ def generate_signal(
         except (TypeError, ValueError):
             pass
 
+    # Fallback: use last bar close when quote fails — keeps position sizing working.
+    if current_price == 0.0 and bars:
+        try:
+            val = float(bars[-1].get("close") or 0)
+            if val > 0:
+                current_price = val
+                logger.debug("[signal] %s using last bar close as price (quote unavailable)", symbol)
+        except (TypeError, ValueError):
+            pass
+
     ohlcv_table = _format_bars(bars, limit=config.lookback_bars)
     context = _compute_context(bars)
 
