@@ -31,6 +31,17 @@ from src.trading.types import READ_CAPABILITIES, TradingProfile
 
 CTRADER_PROFILES: tuple[TradingProfile, ...] = (
     TradingProfile(
+        id="ctrader-demo",
+        label="cTrader Demo",
+        connector="ctrader",
+        transport="broker_sdk",
+        environment="paper",
+        capabilities=READ_CAPABILITIES + ("orders.place",),
+        readonly=False,
+        config={},
+        notes="Read and place orders on a cTrader demo account. Configure credentials in ~/.vibe-trading/ctrader.json.",
+    ),
+    TradingProfile(
         id="ctrader-demo-sdk-readonly",
         label="cTrader Demo (read-only)",
         connector="ctrader",
