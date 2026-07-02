@@ -226,12 +226,41 @@ _reactor_thread: threading.Thread | None = None
 _reactor_ready = threading.Event()
 
 
+_twisted_observer_installed = False
+
+
+def _install_twisted_log_filter() -> None:
+    """Suppress harmless Twisted deferred-cleanup errors from cTrader connections."""
+    global _twisted_observer_installed
+    if _twisted_observer_installed:
+        return
+    _twisted_observer_installed = True
+    try:
+        from twisted.python import log as twisted_log
+
+        def _observer(event: dict) -> None:
+            if event.get("isError") and event.get("failure"):
+                failure = event["failure"]
+                if failure.type.__name__ in ("TimeoutError", "CancelledError",
+                                              "ConnectionDone", "ConnectionLost"):
+                    return  # suppress noisy cleanup errors
+            msg = twisted_log.textFromEventDict(event)
+            if msg:
+                logger.debug("[twisted] %s", msg.strip())
+
+        twisted_log.addObserver(_observer)
+    except Exception:
+        pass
+
+
 def _ensure_reactor() -> None:
     """Start the Twisted reactor in a daemon thread (idempotent)."""
     global _reactor_thread
     with _reactor_lock:
         if _reactor_thread is not None and _reactor_thread.is_alive():
             return
+
+        _install_twisted_log_filter()
 
         def _run() -> None:
             try:
