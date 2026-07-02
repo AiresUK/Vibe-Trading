@@ -407,6 +407,96 @@ def _safe_stop(client: Any) -> None:
         pass
 
 
+def _execute_app_only(
+    config: CTraderConfig,
+    make_request: Any,
+    *,
+    timeout: int | None = None,
+) -> Any:
+    """Like _execute but skips account auth — used for account discovery."""
+    config = _maybe_refresh_token(config)
+    _check_dependency()
+    _ensure_reactor()
+
+    timeout = timeout or config.timeout
+    result_q: _queue.Queue[Any] = _queue.Queue()
+
+    def put_result(value: Any) -> None:
+        result_q.put(value)
+
+    def _start() -> None:
+        try:
+            from ctrader_open_api import Client, TcpProtocol, EndPoints
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOAApplicationAuthReq,
+                ProtoOAApplicationAuthRes,
+                ProtoOAErrorRes,
+            )
+
+            host = (
+                EndPoints.PROTOBUF_DEMO_HOST
+                if config.environment == "demo"
+                else EndPoints.PROTOBUF_LIVE_HOST
+            )
+            phase = ["connecting"]
+
+            def on_message(client: Any, message: Any) -> None:
+                try:
+                    payload_type = message.payloadType
+                    try:
+                        err_type = ProtoOAErrorRes().payloadType
+                        if payload_type == err_type:
+                            err = ProtoOAErrorRes()
+                            err.ParseFromString(message.payload)
+                            result_q.put(RuntimeError(f"cTrader error {err.errorCode}: {err.description}"))
+                            _safe_stop(client)
+                            return
+                    except Exception:
+                        pass
+
+                    if phase[0] == "app_auth":
+                        if payload_type == ProtoOAApplicationAuthRes().payloadType:
+                            phase[0] = "request"
+                            make_request(client, message, put_result, _safe_stop)
+                    elif phase[0] == "request":
+                        if hasattr(make_request, "on_message"):
+                            make_request.on_message(client, message, put_result, _safe_stop)
+                except Exception as exc:
+                    result_q.put(exc)
+                    _safe_stop(client)
+
+            def on_connected(client: Any) -> None:
+                phase[0] = "app_auth"
+                req = ProtoOAApplicationAuthReq()
+                req.clientId = config.client_id
+                req.clientSecret = config.client_secret
+                client.send(req)
+
+            def on_disconnected(client: Any, reason: Any = None) -> None:
+                if result_q.empty():
+                    result_q.put(RuntimeError("cTrader disconnected before response"))
+
+            ct_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+            ct_client.setConnectedCallback(on_connected)
+            ct_client.setDisconnectedCallback(on_disconnected)
+            ct_client.setMessageReceivedCallback(on_message)
+            ct_client.startService()
+        except Exception as exc:
+            result_q.put(exc)
+
+    from twisted.internet import reactor
+    reactor.callFromThread(_start)
+
+    try:
+        value = result_q.get(timeout=timeout)
+    except _queue.Empty:
+        raise TimeoutError(f"cTrader API call timed out after {timeout}s")
+
+    if isinstance(value, Exception):
+        raise value
+    return value
+
+
 def _check_dependency() -> None:
     try:
         import ctrader_open_api  # noqa: F401
@@ -607,6 +697,25 @@ class _NewOrderRequest(_RequestHandler):
             stop(client)
 
 
+class _AccountListRequest(_RequestHandler):
+    def __init__(self, access_token: str) -> None:
+        self._access_token = access_token
+
+    def _send(self, client: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetAccountListByAccessTokenReq
+        req = ProtoOAGetAccountListByAccessTokenReq()
+        req.accessToken = self._access_token
+        client.send(req)
+
+    def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetAccountListByAccessTokenRes
+        if msg.payloadType == ProtoOAGetAccountListByAccessTokenRes().payloadType:
+            res = ProtoOAGetAccountListByAccessTokenRes()
+            res.ParseFromString(msg.payload)
+            put(res)
+            stop(client)
+
+
 class _ClosePositionRequest(_RequestHandler):
     def __init__(self, account_id: int, position_id: int, volume: int) -> None:
         self._account_id = account_id
@@ -733,6 +842,29 @@ def check_status(config: CTraderConfig | None = None) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+
+
+def list_accounts(config: CTraderConfig | None = None) -> list[dict[str, Any]]:
+    """List all trading accounts linked to the access token.
+
+    Returns the ctidTraderAccountId for each account. This is the correct
+    ID to put in ctrader.json — NOT the broker account number shown in cTrader Desktop.
+    """
+    if config is None:
+        config = load_config()
+    _check_dependency()
+    try:
+        res = _execute_app_only(config, _AccountListRequest(config.access_token))
+        accounts = []
+        for acc in res.ctidTraderAccount:
+            accounts.append({
+                "ctid_trader_account_id": acc.ctidTraderAccountId,
+                "is_live": acc.isLive,
+                "trader_login": getattr(acc, "traderLogin", None),
+            })
+        return accounts
+    except Exception as exc:
+        return [{"error": str(exc)}]
 
 
 def get_account_snapshot(config: CTraderConfig) -> dict[str, Any]:
