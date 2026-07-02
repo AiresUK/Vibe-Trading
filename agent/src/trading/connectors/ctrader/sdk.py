@@ -313,7 +313,7 @@ def _execute(
                 req.clientSecret = config.client_secret
                 client.send(req)
 
-            def on_disconnected(client: Any) -> None:
+            def on_disconnected(client: Any, reason: Any = None) -> None:
                 if result_q.empty():
                     result_q.put(RuntimeError("cTrader disconnected before response"))
 
