@@ -55,14 +55,31 @@ class SetupSignalTradeTool(BaseTool):
             save_signal_config,
         )
 
-        profile_id = str(kwargs.get("profile_id", "")).strip()
+        # Reuse existing config if updating — allows partial updates (only patch
+        # the fields explicitly supplied; inherit everything else from saved config).
+        config_id_hint = str(kwargs.get("config_id", "")).strip()
+        existing = get_signal_config(config_id_hint) if config_id_hint else None
+        config_id = existing.config_id if existing else new_signal_config_id()
+
+        # Resolve each parameter: explicit kwarg → existing value → default.
+        def _get(key: str, default: Any) -> Any:
+            if key in kwargs and str(kwargs[key]).strip():
+                return kwargs[key]
+            if existing is not None and hasattr(existing, key):
+                return getattr(existing, key)
+            return default
+
+        profile_id = str(_get("profile_id", "")).strip()
         if not profile_id:
             return "Error: profile_id is required."
 
-        watchlist_raw = str(kwargs.get("watchlist", "")).strip()
+        watchlist_raw = str(_get("watchlist", "")).strip()
         if not watchlist_raw:
             return "Error: watchlist is required (comma-separated symbols, e.g. EURUSD,GBPUSD)."
-        watchlist = [s.strip().upper() for s in watchlist_raw.split(",") if s.strip()]
+        if isinstance(watchlist_raw, list):
+            watchlist = [s.strip().upper() for s in watchlist_raw if s.strip()]
+        else:
+            watchlist = [s.strip().upper() for s in watchlist_raw.split(",") if s.strip()]
         if not watchlist:
             return "Error: watchlist contains no valid symbols."
 
@@ -72,55 +89,57 @@ class SetupSignalTradeTool(BaseTool):
         except Exception as exc:
             return f"Error: profile '{profile_id}' not found — {exc}"
 
-        timeframe = str(kwargs.get("timeframe", "1h")).strip().lower()
+        timeframe = str(_get("timeframe", "1h")).strip().lower()
         valid_timeframes = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "1d", "1w"}
         if timeframe not in valid_timeframes:
             return f"Error: timeframe must be one of {sorted(valid_timeframes)}."
 
         try:
-            lookback_bars = int(kwargs.get("lookback_bars", 50))
+            lookback_bars = int(_get("lookback_bars", 50))
             if not (20 <= lookback_bars <= 200):
                 return "Error: lookback_bars must be between 20 and 200."
         except (TypeError, ValueError):
             return "Error: lookback_bars must be an integer."
 
         try:
-            min_confidence = float(kwargs.get("min_confidence", 0.65))
+            min_confidence = float(_get("min_confidence", 0.65))
             if not (0.0 <= min_confidence <= 1.0):
                 return "Error: min_confidence must be between 0.0 and 1.0."
         except (TypeError, ValueError):
             return "Error: min_confidence must be a number."
 
         try:
-            risk_per_trade_pct = float(kwargs.get("risk_per_trade_pct", 1.0))
+            risk_per_trade_pct = float(_get("risk_per_trade_pct", 1.0))
             if not (0.1 <= risk_per_trade_pct <= 5.0):
                 return "Error: risk_per_trade_pct must be between 0.1 and 5.0."
         except (TypeError, ValueError):
             return "Error: risk_per_trade_pct must be a number."
 
         try:
-            max_positions = int(kwargs.get("max_positions", 5))
+            max_positions = int(_get("max_positions", 5))
             if not (1 <= max_positions <= 20):
                 return "Error: max_positions must be between 1 and 20."
         except (TypeError, ValueError):
             return "Error: max_positions must be an integer."
 
         interval_raw = kwargs.get("interval_minutes")
-        interval_minutes: int | None = None
-        if interval_raw is not None and str(interval_raw).strip():
+        if interval_raw is None and existing is not None:
+            interval_minutes: int | None = existing.interval_minutes
+        elif interval_raw is not None and str(interval_raw).strip():
             try:
                 interval_minutes = int(interval_raw)
                 if interval_minutes < 5:
                     return "Error: interval_minutes must be at least 5."
             except (TypeError, ValueError):
                 return "Error: interval_minutes must be an integer."
+        else:
+            interval_minutes = None
 
-        label = str(kwargs.get("label", "")).strip()
-
-        # Reuse existing config if updating.
-        config_id_hint = str(kwargs.get("config_id", "")).strip()
-        existing = get_signal_config(config_id_hint) if config_id_hint else None
-        config_id = existing.config_id if existing else new_signal_config_id()
+        label_raw = kwargs.get("label")
+        if label_raw is None and existing is not None:
+            label = existing.label
+        else:
+            label = str(label_raw or "").strip()
 
         config = SignalConfig(
             config_id=config_id,
