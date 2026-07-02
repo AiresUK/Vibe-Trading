@@ -1067,19 +1067,44 @@ def place_order(
     # Minimum 1,000 units (= 0.01 lots) to stay above broker minimums.
     volume = max(1000, int(round(qty)))
 
+    logger.info(
+        "[ctrader] Placing %s %s: symbolId=%s vol=%d sl=%s tp=%s",
+        side.upper(), symbol, symbol_id, volume, stop_loss, take_profit,
+    )
+
     res = _execute(
         config,
         _NewOrderRequest(config.account_id, symbol_id, trade_side, volume, stop_loss, take_profit),
     )
+
+    # ProtoOAExecutionType: ORDER_FILLED=3, ORDER_ACCEPTED=2, ORDER_REJECTED=7
+    exec_type = res.executionType
+    if exec_type == 7:  # ORDER_REJECTED
+        error_code = ""
+        try:
+            error_code = res.errorCode or ""
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"cTrader rejected order {symbol} {side} vol={volume} sl={stop_loss} tp={take_profit}: {error_code or 'ORDER_REJECTED'}"
+        )
+
+    position_id = res.position.positionId if res.HasField("position") else None
+    if exec_type not in (2, 3, 11) and position_id is None:
+        logger.warning(
+            "[ctrader] Unexpected executionType=%s for %s %s — no position created",
+            exec_type, side, symbol,
+        )
+
     result: dict[str, Any] = {
         "symbol": symbol,
         "side": side,
         "quantity": qty,
         "volume": volume,
-        "execution_type": res.executionType,
+        "execution_type": exec_type,
         "order_id": res.order.orderId if res.HasField("order") else None,
-        "position_id": res.position.positionId if res.HasField("position") else None,
-        "status": "placed",
+        "position_id": position_id,
+        "status": "placed" if position_id else "accepted",
     }
     if stop_loss is not None:
         result["stop_loss"] = stop_loss
