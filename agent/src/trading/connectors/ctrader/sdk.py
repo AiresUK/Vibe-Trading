@@ -948,8 +948,18 @@ def get_account_snapshot(config: CTraderConfig) -> dict[str, Any]:
     res = _execute(config, _TraderRequest(config.account_id))
     t = res.trader
     balance = t.balance / 100.0
-    equity = t.equity / 100.0 if t.HasField("equity") else balance
-    used_margin = t.marginUsed / 100.0 if t.HasField("marginUsed") else 0.0
+    try:
+        equity = t.equity / 100.0 if t.HasField("equity") else balance
+    except (ValueError, AttributeError):
+        equity = balance
+    try:
+        used_margin = t.marginUsed / 100.0 if t.HasField("marginUsed") else 0.0
+    except (ValueError, AttributeError):
+        used_margin = 0.0
+    try:
+        currency = t.depositAsset.name if t.HasField("depositAsset") else "USD"
+    except (ValueError, AttributeError):
+        currency = "USD"
     return {
         "account_id": config.account_id,
         "environment": config.environment,
@@ -957,7 +967,7 @@ def get_account_snapshot(config: CTraderConfig) -> dict[str, Any]:
         "equity": equity,
         "used_margin": used_margin,
         "free_margin": equity - used_margin,
-        "currency": t.depositAsset.name if t.HasField("depositAsset") else "USD",
+        "currency": currency,
     }
 
 
