@@ -327,7 +327,7 @@ class GetSignalStatusTool(BaseTool):
             cycles = load_recent_signal_cycles(cid, n=n_cycles)
             if cycles:
                 lines.append(f"\n  Recent cycles ({len(cycles)}):")
-                for cyc in cycles:
+                for i, cyc in enumerate(cycles):
                     ts = str(cyc.get("ts", ""))[:16]
                     n_sig = len(cyc.get("signals", []))
                     n_placed = len(cyc.get("orders_placed", []))
@@ -339,6 +339,23 @@ class GetSignalStatusTool(BaseTool):
                         f"    {ts}  signals={n_sig}  placed={n_placed}  "
                         f"skipped={n_skip}  errors={n_err}{eq_str}"
                     )
+                    # Show per-symbol signal breakdown for most recent cycle only.
+                    if i == 0 and cyc.get("signals"):
+                        for s in cyc["signals"]:
+                            direction = s.get("direction", "hold").upper()
+                            conf = s.get("confidence", 0.0)
+                            sym = s.get("symbol", "?")
+                            icon = {"BUY": "▲", "SELL": "▼", "HOLD": "—"}.get(direction, "?")
+                            reason = s.get("reasoning", "")[:80]
+                            lines.append(
+                                f"      {icon} {sym:<10} {direction:<4}  conf={conf:.0%}"
+                                + (f"  {reason}" if reason else "")
+                            )
+                        if cyc.get("errors"):
+                            for e in cyc["errors"]:
+                                sym = e.get("symbol", "?")
+                                err = e.get("error", str(e))[:80]
+                                lines.append(f"      ✗ {sym}: {err}")
             lines.append("")
 
         return "\n".join(lines)

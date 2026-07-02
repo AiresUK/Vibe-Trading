@@ -234,6 +234,13 @@ def run_signal_cycle(
         signals.append(sig)
         result.signals.append(sig.to_dict())
 
+        # Surface silent fallback failures (empty bars, LLM crash, parse error) as errors
+        # so they show up in cycle stats rather than looking like genuine HOLD signals.
+        if sig.direction == "hold" and sig.confidence == 0.0 and sig.reasoning:
+            _FALLBACK_PREFIXES = ("No historical data", "LLM error:", "Could not parse")
+            if any(sig.reasoning.startswith(p) for p in _FALLBACK_PREFIXES):
+                result.errors.append({"symbol": symbol, "error": sig.reasoning})
+
     # 5. Filter actionable signals.
     actionable = [
         s for s in signals
