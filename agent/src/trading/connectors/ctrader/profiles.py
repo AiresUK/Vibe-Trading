@@ -27,7 +27,7 @@ Compatible brokers: any broker running cTrader (Pepperstone, IC Markets,
 Vantage cTrader accounts, FTMO cTrader challenge accounts, etc.).
 """
 
-from src.trading.profiles import READ_CAPABILITIES, TradingProfile
+from src.trading.types import READ_CAPABILITIES, TradingProfile
 
 CTRADER_PROFILES: tuple[TradingProfile, ...] = (
     TradingProfile(
@@ -36,8 +36,10 @@ CTRADER_PROFILES: tuple[TradingProfile, ...] = (
         connector="ctrader",
         transport="broker_sdk",
         environment="paper",
-        config={},
         capabilities=READ_CAPABILITIES,
+        readonly=True,
+        config={},
+        notes="Read-only access to a cTrader demo account. Configure credentials in ~/.vibe-trading/ctrader.json.",
     ),
     TradingProfile(
         id="ctrader-demo-trade",
@@ -45,8 +47,10 @@ CTRADER_PROFILES: tuple[TradingProfile, ...] = (
         connector="ctrader",
         transport="broker_sdk",
         environment="paper",
-        config={},
         capabilities=READ_CAPABILITIES + ("orders.place",),
+        readonly=False,
+        config={},
+        notes="Read and place orders on a cTrader demo account. Configure credentials in ~/.vibe-trading/ctrader.json.",
     ),
     TradingProfile(
         id="ctrader-live-sdk-readonly",
@@ -54,8 +58,10 @@ CTRADER_PROFILES: tuple[TradingProfile, ...] = (
         connector="ctrader",
         transport="broker_sdk",
         environment="live",
-        config={},
         capabilities=READ_CAPABILITIES,
+        readonly=True,
+        config={},
+        notes="Read-only access to a cTrader live account. Configure credentials in ~/.vibe-trading/ctrader.json.",
     ),
     TradingProfile(
         id="ctrader-live-trade",
@@ -63,7 +69,9 @@ CTRADER_PROFILES: tuple[TradingProfile, ...] = (
         connector="ctrader",
         transport="broker_sdk",
         environment="live",
-        config={},
         capabilities=READ_CAPABILITIES + ("orders.place.requires_mandate",),
+        readonly=False,
+        config={},
+        notes="Read and place orders on a cTrader live account. Live orders require an authorised mandate. Configure credentials in ~/.vibe-trading/ctrader.json.",
     ),
 )
