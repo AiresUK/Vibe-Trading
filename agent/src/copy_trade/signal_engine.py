@@ -394,7 +394,7 @@ def run_signal_cycle(
                     session_id=session_id,
                 )
                 pos_id = broker_resp.get("position_id")
-                vol = broker_resp.get("volume", int(round(o_qty * 100000)))
+                vol = broker_resp.get("volume", max(1000, int(round(o_qty))))
                 result.orders_placed.append(
                     OrderResult(
                         symbol=sig.symbol,

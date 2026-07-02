@@ -1051,8 +1051,11 @@ def place_order(
     qty = float(quantity or 0)
     symbol_id = _get_symbol_id(symbol, config)
     trade_side = 1 if side.lower() == "buy" else 2  # ProtoOATradeSide: BUY=1, SELL=2
-    # Convert lots to cTrader volume units (1 standard lot = 100,000 units)
-    volume = max(1000, int(round(qty * 100000)))
+    # qty from the signal engine = risk_notional / current_price = base-currency units
+    # (e.g. 90.9 EUR for EURUSD).  cTrader volume is already in base-currency units
+    # (1 standard lot = 100,000 units), so no multiplier needed.
+    # Minimum 1,000 units (= 0.01 lots) to stay above broker minimums.
+    volume = max(1000, int(round(qty)))
 
     res = _execute(
         config,
