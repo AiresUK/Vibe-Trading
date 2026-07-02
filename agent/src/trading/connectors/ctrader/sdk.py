@@ -704,12 +704,24 @@ class _TrendbarsRequest(_RequestHandler):
     def _send(self, client: Any) -> None:
         import time
         from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsReq
+
+        # fromTimestamp is a required proto2 field — compute from period + count.
+        _period_ms = {
+            1: 60_000, 2: 120_000, 3: 180_000, 4: 240_000, 5: 300_000,
+            6: 600_000, 7: 900_000, 8: 1_800_000,
+            9: 3_600_000, 10: 14_400_000, 11: 43_200_000,
+            12: 86_400_000, 13: 604_800_000, 14: 2_592_000_000,
+        }
+        now_ms = int(time.time() * 1000)
+        bar_ms = _period_ms.get(self._period, 3_600_000)
+
         req = ProtoOAGetTrendbarsReq()
         req.ctidTraderAccountId = self._account_id
         req.symbolId = self._symbol_id
         req.period = self._period
         req.count = self._count
-        req.toTimestamp = int(time.time() * 1000)
+        req.fromTimestamp = now_ms - self._count * bar_ms
+        req.toTimestamp = now_ms
         client.send(req)
 
     def on_message(self, client: Any, msg: Any, put: Any, stop: Any) -> None:
