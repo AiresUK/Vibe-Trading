@@ -46,7 +46,7 @@ class SetupSignalTradeTool(BaseTool):
         "label (optional name)."
     )
 
-    def run(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str:
         from src.copy_trade.signal_models import SignalConfig
         from src.copy_trade.state import (
             get_signal_config,
@@ -189,7 +189,7 @@ class RunSignalCycleTool(BaseTool):
         "set true to preview without placing real orders), session_id (optional)."
     )
 
-    def run(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str:
         from src.copy_trade.signal_engine import run_signal_cycle
         from src.copy_trade.state import get_signal_config
 
@@ -279,7 +279,7 @@ class GetSignalStatusTool(BaseTool):
         "cycles (int, default 3 — number of recent cycles to show)."
     )
 
-    def run(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str:
         from src.copy_trade.state import (
             load_all_signal_configs,
             load_recent_signal_cycles,
@@ -369,7 +369,7 @@ class StartSignalSchedulerTool(BaseTool):
         "No parameters required."
     )
 
-    def run(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str:
         from src.copy_trade.signal_scheduler import scheduler_running, start_scheduler
         from src.copy_trade.state import load_all_signal_configs
 
@@ -420,7 +420,7 @@ class StopSignalSchedulerTool(BaseTool):
         "No parameters required."
     )
 
-    def run(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str:
         from src.copy_trade.signal_scheduler import scheduler_running, stop_scheduler
 
         if not scheduler_running():
