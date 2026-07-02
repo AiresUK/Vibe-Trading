@@ -585,11 +585,10 @@ class _NewOrderRequest(_RequestHandler):
 
     def _send(self, client: Any) -> None:
         from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
-        from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOAOrderType
         req = ProtoOANewOrderReq()
         req.ctidTraderAccountId = self._account_id
         req.symbolId = self._symbol_id
-        req.orderType = ProtoOAOrderType.Value("MARKET")
+        req.orderType = 1  # ProtoOAOrderType.MARKET
         req.tradeSide = self._side
         req.volume = self._volume
         req.comment = "vibe-trading"
@@ -702,10 +701,17 @@ _PERIOD_MAP = {
 }
 
 
+_TRENDBAR_PERIOD_VALUES = {
+    "M1": 1, "M2": 2, "M3": 3, "M4": 4, "M5": 5,
+    "M10": 6, "M15": 7, "M30": 8,
+    "H1": 9, "H4": 10, "H12": 11,
+    "D1": 12, "W1": 13, "MN1": 14,
+}
+
+
 def _period_to_ctrader(period: str) -> int:
-    from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOATrendbarPeriod
     name = _PERIOD_MAP.get(period.lower(), "H1")
-    return ProtoOATrendbarPeriod.Value(name)
+    return _TRENDBAR_PERIOD_VALUES.get(name, 9)  # default H1=9
 
 
 # ---------------------------------------------------------------------------
@@ -833,11 +839,9 @@ def place_order(
     take_profit: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    from ctrader_open_api.messages.OpenApiCommonModelMessages_pb2 import ProtoOATradeSide
-
     qty = float(quantity or 0)
     symbol_id = _get_symbol_id(symbol, config)
-    trade_side = ProtoOATradeSide.Value("BUY" if side.lower() == "buy" else "SELL")
+    trade_side = 1 if side.lower() == "buy" else 2  # ProtoOATradeSide: BUY=1, SELL=2
     # Convert lots to cTrader volume units (1 standard lot = 100,000 units)
     volume = max(1000, int(round(qty * 100000)))
 
