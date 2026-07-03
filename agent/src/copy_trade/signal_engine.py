@@ -228,11 +228,10 @@ def run_signal_cycle(
 
         bars_by_symbol[symbol] = bars_raw
 
-        try:
-            quote_raw = get_quote(symbol, config.profile_id)
-        except Exception as exc:
-            logger.debug("[signal] Could not fetch quote for %s: %s", symbol, exc)
-            quote_raw = {}
+        # Skip live-quote fetch during signal generation — uses 4 extra TCP connections
+        # that overwhelm the cTrader server. The signal generator falls back to the last
+        # bar close for current_price, and we fetch a live quote per-order at placement time.
+        quote_raw: dict = {}
 
         # Pass tracked position so the AI can evaluate hold-vs-exit.
         open_pos = next(
@@ -328,11 +327,23 @@ def run_signal_cycle(
 
     for sig in to_execute:
         # Pause between orders to avoid hitting cTrader connection rate limits.
-        _time.sleep(1.5)
+        _time.sleep(2.0)
+
+        # Fetch live quote now (just-in-time, only for actionable signals).
+        # This gives an accurate current price for qty sizing and SL/TP without
+        # burning connections during signal generation for all 4 symbols.
+        live_price = 0.0
+        try:
+            q = get_quote(sig.symbol, config.profile_id)
+            live_price = float(q.get("price") or q.get("last") or 0)
+            if live_price > 0:
+                sig.current_price = live_price
+                logger.info("[signal] %s live quote for order: %.5f", sig.symbol, live_price)
+        except Exception as exc:
+            logger.debug("[signal] Quote fetch failed for %s at order time: %s", sig.symbol, exc)
 
         # Compute order quantity from equity risk.
-        # Use sig.current_price; fall back to most-recent bar close if the
-        # live quote wasn't available (spot subscription returning bid=0).
+        # Use live quote if available, otherwise last bar close price.
         effective_price = sig.current_price
         if effective_price <= 0:
             for bar in reversed(bars_by_symbol.get(sig.symbol, {}).get("bars", [])):
