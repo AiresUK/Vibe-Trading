@@ -213,7 +213,7 @@ def run_signal_cycle(
     signals: list[Signal] = []
     bars_by_symbol: dict[str, dict] = {}
     for symbol in config.watchlist:
-        _time_fetch.sleep(2.0)  # pause between symbols — lets previous TCP connection fully close
+        _time_fetch.sleep(0.5)  # brief pause between symbols
         try:
             bars_raw = get_historical_bars(
                 symbol,
@@ -326,8 +326,8 @@ def run_signal_cycle(
     import time as _time
 
     for sig in to_execute:
-        # Pause between orders to avoid hitting cTrader connection rate limits.
-        _time.sleep(2.0)
+        # Pause between orders.
+        _time.sleep(0.5)
 
         # Fetch live quote now (just-in-time, only for actionable signals).
         # This gives an accurate current price for qty sizing and SL/TP without

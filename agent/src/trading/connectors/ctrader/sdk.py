@@ -95,7 +95,7 @@ class CTraderConfig:
     token_expires_at: str = ""
     account_id: int = 0
     environment: str = "demo"
-    timeout: int = 30
+    timeout: int = 15
 
 
 def _config_path() -> Path:
@@ -294,7 +294,7 @@ _RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadylogge
 # causes ALREADYLOGGEDIN / disconnect errors. This lock serialises every
 # API call so only one TCP connection is ever open at once.
 _api_call_lock = threading.Lock()
-_API_COOLDOWN_S = 2.0  # seconds to wait after each call before the next
+_API_COOLDOWN_S = 1.0  # seconds to wait after each call before the next
 
 
 def _execute(
@@ -1058,7 +1058,7 @@ def get_open_orders(config: CTraderConfig) -> dict[str, Any]:
 
 def get_quote(symbol: str, config: CTraderConfig) -> dict[str, Any]:
     symbol_id = _get_symbol_id(symbol, config)
-    evt = _execute_retrying(config, _SpotRequest(config.account_id, symbol_id))
+    evt = _execute_retrying(config, _SpotRequest(config.account_id, symbol_id), max_retries=2)
     bid = evt.bid / 100000.0 if evt.bid else 0.0
     ask = evt.ask / 100000.0 if evt.ask else 0.0
     mid = (bid + ask) / 2 if bid and ask else (bid or ask)
@@ -1081,7 +1081,7 @@ def get_historical_bars(
 ) -> dict[str, Any]:
     symbol_id = _get_symbol_id(symbol, config)
     period_int = _period_to_ctrader(period)
-    res = _execute_retrying(config, _TrendbarsRequest(config.account_id, symbol_id, period_int, limit))
+    res = _execute_retrying(config, _TrendbarsRequest(config.account_id, symbol_id, period_int, limit), max_retries=2)
     bars = []
     for bar in res.trendbar:
         ts_s = bar.utcTimestampInMinutes * 60
