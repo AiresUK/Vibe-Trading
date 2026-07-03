@@ -304,121 +304,22 @@ def _execute(
     *,
     timeout: int | None = None,
 ) -> Any:
-    """Connect to cTrader, authenticate, execute one request, return result.
+    """Execute one cTrader API request using the auto-persistent session.
 
-    All calls are serialised through ``_api_call_lock`` — the demo server only
-    allows one active application-auth session per client_id.
+    The first call in a cycle opens a TCP connection and authenticates.
+    All subsequent calls in the same cycle reuse that connection — no
+    reconnecting, no per-call rate-limiting, no ALREADYLOGGEDIN errors.
 
-    On timeout we forcibly close the TCP connection before releasing the lock,
-    because the server keeps the session alive until it receives a clean FIN.
-    We then wait for the ``on_disconnected`` callback to fire (confirming the
-    server has seen the FIN) and sleep ``_API_COOLDOWN_S`` extra seconds before
-    the next connection attempt.
+    If the session dies mid-cycle ``_execute_retrying`` catches the error and
+    retries; ``_get_auto_session`` then creates a fresh connection.
     """
-    import time as _t
-
     config = _maybe_refresh_token(config)
-    _check_dependency()
-    _ensure_reactor()
-
-    # Hard-cap timeout — ctrader.json may store an old/large value.
-    timeout = min(timeout or config.timeout, _MAX_TIMEOUT_S)
-    result_q: _queue.Queue[Any] = _queue.Queue()
-    disconnect_event = threading.Event()
-    cleanup_client: list[Any] = [None]  # reference so we can force-close on timeout
-
-    def put_result(value: Any) -> None:
-        result_q.put(value)
-
-    def _start() -> None:
-        try:
-            from ctrader_open_api import Client, TcpProtocol, EndPoints
-            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-                ProtoOAApplicationAuthReq,
-                ProtoOAAccountAuthReq,
-            )
-
-            host = (
-                EndPoints.PROTOBUF_DEMO_HOST
-                if config.environment == "demo"
-                else EndPoints.PROTOBUF_LIVE_HOST
-            )
-            client_holder: list[Any] = []
-            phase = ["connecting"]
-
-            def on_message(client: Any, message: Any) -> None:
-                try:
-                    _handle_message(
-                        client, message, config, phase, client_holder,
-                        make_request, put_result,
-                    )
-                except Exception as exc:
-                    logger.exception("[ctrader] on_message error")
-                    result_q.put(exc)
-                    _safe_stop(client)
-
-            def on_connected(client: Any) -> None:
-                _orig_send = client.send
-
-                def _patched_send(*a: Any, **kw: Any) -> Any:
-                    d = _orig_send(*a, **kw)
-                    if d is not None:
-                        try:
-                            from twisted.internet import defer as _defer
-                            d.addErrback(
-                                lambda f: f.trap(_defer.TimeoutError, _defer.CancelledError)
-                            )
-                        except Exception:
-                            pass
-                    return d
-
-                client.send = _patched_send
-                client_holder.append(client)
-                cleanup_client[0] = client  # store so timeout path can force-close
-                phase[0] = "app_auth"
-                req = ProtoOAApplicationAuthReq()
-                req.clientId = config.client_id
-                req.clientSecret = config.client_secret
-                client.send(req)
-
-            def on_disconnected(client: Any, reason: Any = None) -> None:
-                if result_q.empty():
-                    result_q.put(RuntimeError("cTrader disconnected before response"))
-                disconnect_event.set()  # confirm TCP is closed
-
-            ct_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
-            ct_client.setConnectedCallback(on_connected)
-            ct_client.setDisconnectedCallback(on_disconnected)
-            ct_client.setMessageReceivedCallback(on_message)
-            ct_client.startService()
-        except Exception as exc:
-            result_q.put(exc)
-
-    from twisted.internet import reactor
-
-    with _api_call_lock:
-        reactor.callFromThread(_start)
-        timed_out = False
-        try:
-            value = result_q.get(timeout=timeout)
-        except _queue.Empty:
-            timed_out = True
-            value = TimeoutError(f"cTrader API call timed out after {timeout}s")
-
-        if timed_out:
-            # The server still thinks we're connected — force-close the TCP socket
-            # so it releases the session before we attempt the next connection.
-            c = cleanup_client[0]
-            if c is not None:
-                reactor.callFromThread(lambda: _safe_stop(c))
-
-        # Wait for on_disconnected to confirm the TCP close, then buffer.
-        disconnect_event.wait(timeout=5.0)
-        _t.sleep(_API_COOLDOWN_S)
-
-    if isinstance(value, Exception):
-        raise value
-    return value
+    try:
+        sess = _get_auto_session(config)
+        return sess.execute(make_request, timeout=timeout)
+    except Exception:
+        _invalidate_auto_session()
+        raise
 
 
 def _execute_retrying(
@@ -520,6 +421,227 @@ def _safe_stop(client: Any) -> None:
         client.stopService()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Persistent session — one TCP connection reused for all requests in a cycle
+# ---------------------------------------------------------------------------
+
+
+class CTraderSession:
+    """Persistent authenticated cTrader TCP connection.
+
+    Connects and authenticates ONCE.  Subsequent calls to ``execute()`` send
+    requests over the same open socket, completely avoiding the per-connection
+    rate-limit on cTrader demo servers (ALREADYLOGGEDIN / timeout cascade).
+
+    Thread-safe: requests are serialised with an internal lock so only one
+    request is in-flight at a time (the cTrader API is inherently sequential).
+
+    Typically managed via the module-level auto-session helpers so callers
+    don't need to change their code.
+    """
+
+    def __init__(self, config: CTraderConfig) -> None:
+        self._config = config
+        self._client: Any = None
+        self._alive = False
+        self._account_id = config.account_id
+        self._lock = threading.Lock()
+        self._current_rq: "_queue.Queue | None" = None
+        self._current_handler: Any = None
+
+    @property
+    def alive(self) -> bool:
+        return self._alive
+
+    @property
+    def account_id(self) -> int:
+        return self._account_id
+
+    def connect(self, timeout: int = 15) -> None:
+        """Open TCP connection and authenticate once.  Blocks until ready."""
+        config = self._config
+        _check_dependency()
+        _ensure_reactor()
+
+        from ctrader_open_api import Client, TcpProtocol, EndPoints
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAApplicationAuthReq, ProtoOAApplicationAuthRes,
+            ProtoOAAccountAuthReq, ProtoOAAccountAuthRes, ProtoOAErrorRes,
+        )
+        from twisted.internet import reactor as _reactor, defer as _defer
+
+        phase: list[str] = ["connecting"]
+        connect_q: _queue.Queue = _queue.Queue()
+
+        def on_message(client: Any, message: Any) -> None:
+            try:
+                payload_type = message.payloadType
+                try:
+                    err_type = ProtoOAErrorRes().payloadType
+                    if payload_type == err_type:
+                        err = ProtoOAErrorRes()
+                        err.ParseFromString(message.payload)
+                        exc = RuntimeError(f"cTrader error {err.errorCode}: {err.description}")
+                        if phase[0] in ("app_auth", "account_auth"):
+                            connect_q.put(exc)
+                        elif self._current_rq is not None:
+                            self._current_rq.put(exc)
+                        return
+                except Exception:
+                    pass
+
+                if phase[0] == "app_auth":
+                    if payload_type == ProtoOAApplicationAuthRes().payloadType:
+                        phase[0] = "account_auth"
+                        req = ProtoOAAccountAuthReq()
+                        req.ctidTraderAccountId = config.account_id
+                        req.accessToken = config.access_token
+                        client.send(req)
+                elif phase[0] == "account_auth":
+                    if payload_type == ProtoOAAccountAuthRes().payloadType:
+                        phase[0] = "ready"
+                        self._alive = True
+                        connect_q.put("ok")
+                elif phase[0] == "ready":
+                    rq = self._current_rq
+                    h = self._current_handler
+                    if rq is not None and h is not None and hasattr(h, "on_message"):
+                        h.on_message(client, message, rq.put, lambda c: None)
+            except Exception as exc:
+                if self._current_rq is not None:
+                    self._current_rq.put(exc)
+
+        def on_connected(client: Any) -> None:
+            _orig = client.send
+
+            def _patched(*a: Any, **kw: Any) -> Any:
+                d = _orig(*a, **kw)
+                if d is not None:
+                    try:
+                        d.addErrback(lambda f: f.trap(_defer.TimeoutError, _defer.CancelledError))
+                    except Exception:
+                        pass
+                return d
+
+            client.send = _patched
+            self._client = client
+            phase[0] = "app_auth"
+            req = ProtoOAApplicationAuthReq()
+            req.clientId = config.client_id
+            req.clientSecret = config.client_secret
+            client.send(req)
+
+        def on_disconnected(client: Any, reason: Any = None) -> None:
+            self._alive = False
+            if phase[0] in ("app_auth", "account_auth"):
+                connect_q.put(RuntimeError("cTrader disconnected during auth"))
+            elif self._current_rq is not None and self._current_rq.empty():
+                self._current_rq.put(RuntimeError("cTrader session disconnected mid-request"))
+
+        host = (
+            EndPoints.PROTOBUF_DEMO_HOST if config.environment == "demo"
+            else EndPoints.PROTOBUF_LIVE_HOST
+        )
+        ct_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+        ct_client.setConnectedCallback(on_connected)
+        ct_client.setDisconnectedCallback(on_disconnected)
+        ct_client.setMessageReceivedCallback(on_message)
+
+        _reactor.callFromThread(ct_client.startService)
+
+        try:
+            result = connect_q.get(timeout=timeout)
+        except _queue.Empty:
+            raise TimeoutError(f"cTrader session auth timed out after {timeout}s")
+        if isinstance(result, Exception):
+            raise result
+
+        logger.info("[ctrader] Persistent session open — account %d", config.account_id)
+
+    def execute(self, make_request: Any, *, timeout: int | None = None) -> Any:
+        """Send one request on the open connection and return the response."""
+        if not self._alive:
+            raise RuntimeError("cTrader session not connected")
+        from twisted.internet import reactor as _reactor
+
+        t = min(timeout or self._config.timeout, _MAX_TIMEOUT_S)
+
+        with self._lock:
+            rq: _queue.Queue = _queue.Queue()
+            self._current_rq = rq
+            self._current_handler = make_request
+
+            def _send() -> None:
+                try:
+                    # auth_msg=None: already past auth phase on this connection.
+                    # stop=no-op: do NOT close the connection after this request.
+                    make_request(self._client, None, rq.put, lambda c: None)
+                except Exception as exc:
+                    rq.put(exc)
+
+            _reactor.callFromThread(_send)
+            try:
+                value = rq.get(timeout=t)
+            except _queue.Empty:
+                raise TimeoutError(f"cTrader API call timed out after {t}s")
+            finally:
+                self._current_rq = None
+                self._current_handler = None
+
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def disconnect(self) -> None:
+        """Close the persistent connection."""
+        self._alive = False
+        if self._client is not None:
+            _safe_stop(self._client)
+        logger.info("[ctrader] Persistent session closed — account %d", self._account_id)
+
+    def __enter__(self) -> "CTraderSession":
+        self.connect()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.disconnect()
+
+
+# Module-level auto-session: reused across all _execute calls for the same
+# account within a single cycle.  Invalidated on any error so the next retry
+# gets a fresh connection.
+_auto_session: "CTraderSession | None" = None
+_auto_session_lock = threading.Lock()
+
+
+def _get_auto_session(config: CTraderConfig) -> "CTraderSession":
+    """Return the current auto-session (creating one if needed)."""
+    global _auto_session
+    with _auto_session_lock:
+        sess = _auto_session
+        if sess is not None and sess.alive and sess.account_id == config.account_id:
+            return sess
+        # Need fresh session (first call or previous session died).
+        if sess is not None:
+            try:
+                sess.disconnect()
+            except Exception:
+                pass
+        new_sess = CTraderSession(config)
+        new_sess.connect(timeout=15)
+        _auto_session = new_sess
+        return new_sess
+
+
+def _invalidate_auto_session() -> None:
+    """Mark the current auto-session as dead so the next call reconnects."""
+    global _auto_session
+    with _auto_session_lock:
+        if _auto_session is not None:
+            _auto_session._alive = False
+        _auto_session = None
 
 
 def _execute_app_only(
