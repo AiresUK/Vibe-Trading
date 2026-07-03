@@ -287,7 +287,15 @@ def _ensure_reactor() -> None:
 # ---------------------------------------------------------------------------
 
 
-_RETRYABLE_PHRASES = ("disconnected before response", "timed out")
+_RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadyloggedin", "already_logged_in")
+
+# cTrader demo server only allows ONE active application-auth session per
+# client_id at a time. Opening connections in parallel or back-to-back
+# causes ALREADYLOGGEDIN / disconnect errors. This lock serialises every
+# API call so only one TCP connection is ever open at once.
+_api_call_lock = threading.Lock()
+_API_COOLDOWN_S = 2.0  # seconds to wait after each call before the next
+
 
 def _execute(
     config: CTraderConfig,
@@ -300,7 +308,14 @@ def _execute(
     ``make_request(client, put_result)`` is called after successful auth.
     It should call ``put_result(value)`` with the parsed response or
     ``put_result(Exception(...))`` on error.
+
+    All calls are serialised through ``_api_call_lock`` because cTrader's
+    demo server rejects concurrent application-auth sessions (ALREADYLOGGEDIN).
+    A 2-second cooldown is enforced after each call so the server can clean up
+    the TCP session before the next connection attempt.
     """
+    import time as _t
+
     config = _maybe_refresh_token(config)
     _check_dependency()
     _ensure_reactor()
@@ -378,12 +393,17 @@ def _execute(
             result_q.put(exc)
 
     from twisted.internet import reactor
-    reactor.callFromThread(_start)
 
-    try:
-        value = result_q.get(timeout=timeout)
-    except _queue.Empty:
-        raise TimeoutError(f"cTrader API call timed out after {timeout}s")
+    with _api_call_lock:
+        reactor.callFromThread(_start)
+        try:
+            value = result_q.get(timeout=timeout)
+        except _queue.Empty:
+            raise TimeoutError(f"cTrader API call timed out after {timeout}s")
+        finally:
+            # Always wait before releasing the lock so the server can tear down
+            # the TCP session before the next connection attempt begins.
+            _t.sleep(_API_COOLDOWN_S)
 
     if isinstance(value, Exception):
         raise value
@@ -399,19 +419,18 @@ def _execute_retrying(
 ) -> Any:
     """Like ``_execute`` but retries on transient disconnect / timeout errors.
 
-    Waits 2 s, 4 s, 8 s … between attempts.  Non-retryable errors (auth
-    failures, cTrader error responses) are raised immediately.
+    ``_execute`` already holds a global lock and enforces a 2s cooldown after
+    each attempt, so no extra sleep is needed between retries here.
+    Non-retryable errors (permanent auth failures, cTrader error responses) are
+    raised immediately.
     """
-    import time as _t
     last_exc: Exception | None = None
     for attempt in range(max(1, max_retries)):
         if attempt > 0:
-            delay = 2.0 * attempt
             logger.info(
-                "[ctrader] Retry %d/%d after %.0fs — prev error: %s",
-                attempt, max_retries - 1, delay, last_exc,
+                "[ctrader] Retry %d/%d — prev error: %s",
+                attempt, max_retries - 1, last_exc,
             )
-            _t.sleep(delay)
         try:
             return _execute(config, make_request, timeout=timeout)
         except (RuntimeError, TimeoutError) as exc:
