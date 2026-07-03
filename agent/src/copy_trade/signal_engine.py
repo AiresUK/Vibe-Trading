@@ -213,7 +213,7 @@ def run_signal_cycle(
     signals: list[Signal] = []
     bars_by_symbol: dict[str, dict] = {}
     for symbol in config.watchlist:
-        _time_fetch.sleep(0.5)  # brief pause between symbols to avoid connection bursts
+        _time_fetch.sleep(2.0)  # pause between symbols — lets previous TCP connection fully close
         try:
             bars_raw = get_historical_bars(
                 symbol,

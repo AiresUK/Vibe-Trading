@@ -268,6 +268,12 @@ def generate_signal(
     except (TypeError, ValueError):
         position_size_pct = 100.0
 
+    # LLM is instructed to set position_size_pct=0 for HOLD signals but sometimes
+    # returns 0 for BUY/SELL too. A zero size makes qty=0 and silently skips the order.
+    if direction in ("buy", "sell") and position_size_pct == 0.0:
+        position_size_pct = 100.0
+        logger.debug("[signal] LLM returned position_size_pct=0 for %s %s — defaulting to 100%%", direction.upper(), symbol)
+
     reasoning = str(parsed.get("reasoning", ""))[:500]
 
     logger.info(

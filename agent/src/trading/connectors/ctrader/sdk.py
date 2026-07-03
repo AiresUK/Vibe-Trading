@@ -287,6 +287,8 @@ def _ensure_reactor() -> None:
 # ---------------------------------------------------------------------------
 
 
+_RETRYABLE_PHRASES = ("disconnected before response", "timed out")
+
 def _execute(
     config: CTraderConfig,
     make_request,
@@ -386,6 +388,39 @@ def _execute(
     if isinstance(value, Exception):
         raise value
     return value
+
+
+def _execute_retrying(
+    config: CTraderConfig,
+    make_request: Any,
+    *,
+    timeout: int | None = None,
+    max_retries: int = 3,
+) -> Any:
+    """Like ``_execute`` but retries on transient disconnect / timeout errors.
+
+    Waits 2 s, 4 s, 8 s … between attempts.  Non-retryable errors (auth
+    failures, cTrader error responses) are raised immediately.
+    """
+    import time as _t
+    last_exc: Exception | None = None
+    for attempt in range(max(1, max_retries)):
+        if attempt > 0:
+            delay = 2.0 * attempt
+            logger.info(
+                "[ctrader] Retry %d/%d after %.0fs — prev error: %s",
+                attempt, max_retries - 1, delay, last_exc,
+            )
+            _t.sleep(delay)
+        try:
+            return _execute(config, make_request, timeout=timeout)
+        except (RuntimeError, TimeoutError) as exc:
+            msg = str(exc).lower()
+            if any(p in msg for p in _RETRYABLE_PHRASES):
+                last_exc = exc
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
 
 
 def _handle_message(
@@ -1004,7 +1039,7 @@ def get_open_orders(config: CTraderConfig) -> dict[str, Any]:
 
 def get_quote(symbol: str, config: CTraderConfig) -> dict[str, Any]:
     symbol_id = _get_symbol_id(symbol, config)
-    evt = _execute(config, _SpotRequest(config.account_id, symbol_id))
+    evt = _execute_retrying(config, _SpotRequest(config.account_id, symbol_id))
     bid = evt.bid / 100000.0 if evt.bid else 0.0
     ask = evt.ask / 100000.0 if evt.ask else 0.0
     mid = (bid + ask) / 2 if bid and ask else (bid or ask)
@@ -1027,7 +1062,7 @@ def get_historical_bars(
 ) -> dict[str, Any]:
     symbol_id = _get_symbol_id(symbol, config)
     period_int = _period_to_ctrader(period)
-    res = _execute(config, _TrendbarsRequest(config.account_id, symbol_id, period_int, limit))
+    res = _execute_retrying(config, _TrendbarsRequest(config.account_id, symbol_id, period_int, limit))
     bars = []
     for bar in res.trendbar:
         ts_s = bar.utcTimestampInMinutes * 60
