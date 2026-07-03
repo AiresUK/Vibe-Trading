@@ -200,6 +200,7 @@ class RunSignalCycleTool(BaseTool):
     """
 
     name = "run_signal_cycle"
+    repeatable = True  # each cycle is a fresh market scan; must not be blocked as duplicate
     description = (
         "Analyse the market with AI and auto-place trades on the configured account. "
         "For each symbol in the watchlist the AI reviews recent price history and "
