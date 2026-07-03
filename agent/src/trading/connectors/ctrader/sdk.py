@@ -294,7 +294,7 @@ _RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadylogge
 # causes ALREADYLOGGEDIN / disconnect errors. This lock serialises every
 # API call so only one TCP connection is ever open at once.
 _api_call_lock = threading.Lock()
-_API_COOLDOWN_S = 1.0  # seconds to wait after each call before the next
+_API_COOLDOWN_S = 5.0  # cTrader demo server needs ~5s to fully clean up a session before accepting a new connection
 
 
 def _execute(
