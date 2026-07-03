@@ -294,7 +294,8 @@ _RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadylogge
 # causes ALREADYLOGGEDIN / disconnect errors. This lock serialises every
 # API call so only one TCP connection is ever open at once.
 _api_call_lock = threading.Lock()
-_API_COOLDOWN_S = 5.0  # cTrader demo server needs ~5s to fully clean up a session before accepting a new connection
+_API_COOLDOWN_S = 3.0  # extra buffer (seconds) after confirmed TCP disconnect before next connection
+_MAX_TIMEOUT_S = 12    # hard cap — overrides whatever is stored in ctrader.json
 
 
 def _execute(
@@ -305,14 +306,14 @@ def _execute(
 ) -> Any:
     """Connect to cTrader, authenticate, execute one request, return result.
 
-    ``make_request(client, put_result)`` is called after successful auth.
-    It should call ``put_result(value)`` with the parsed response or
-    ``put_result(Exception(...))`` on error.
+    All calls are serialised through ``_api_call_lock`` — the demo server only
+    allows one active application-auth session per client_id.
 
-    All calls are serialised through ``_api_call_lock`` because cTrader's
-    demo server rejects concurrent application-auth sessions (ALREADYLOGGEDIN).
-    A 2-second cooldown is enforced after each call so the server can clean up
-    the TCP session before the next connection attempt.
+    On timeout we forcibly close the TCP connection before releasing the lock,
+    because the server keeps the session alive until it receives a clean FIN.
+    We then wait for the ``on_disconnected`` callback to fire (confirming the
+    server has seen the FIN) and sleep ``_API_COOLDOWN_S`` extra seconds before
+    the next connection attempt.
     """
     import time as _t
 
@@ -320,8 +321,11 @@ def _execute(
     _check_dependency()
     _ensure_reactor()
 
-    timeout = timeout or config.timeout
+    # Hard-cap timeout — ctrader.json may store an old/large value.
+    timeout = min(timeout or config.timeout, _MAX_TIMEOUT_S)
     result_q: _queue.Queue[Any] = _queue.Queue()
+    disconnect_event = threading.Event()
+    cleanup_client: list[Any] = [None]  # reference so we can force-close on timeout
 
     def put_result(value: Any) -> None:
         result_q.put(value)
@@ -354,10 +358,6 @@ def _execute(
                     _safe_stop(client)
 
             def on_connected(client: Any) -> None:
-                # Patch client.send so every deferred gets an errback that
-                # silently absorbs the 5-second SDK-internal timeout cleanup.
-                # When _safe_stop() closes the connection, pending deferreds
-                # are cancelled; without this they spew TimeoutError to stderr.
                 _orig_send = client.send
 
                 def _patched_send(*a: Any, **kw: Any) -> Any:
@@ -374,6 +374,7 @@ def _execute(
 
                 client.send = _patched_send
                 client_holder.append(client)
+                cleanup_client[0] = client  # store so timeout path can force-close
                 phase[0] = "app_auth"
                 req = ProtoOAApplicationAuthReq()
                 req.clientId = config.client_id
@@ -383,6 +384,7 @@ def _execute(
             def on_disconnected(client: Any, reason: Any = None) -> None:
                 if result_q.empty():
                     result_q.put(RuntimeError("cTrader disconnected before response"))
+                disconnect_event.set()  # confirm TCP is closed
 
             ct_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
             ct_client.setConnectedCallback(on_connected)
@@ -396,14 +398,23 @@ def _execute(
 
     with _api_call_lock:
         reactor.callFromThread(_start)
+        timed_out = False
         try:
             value = result_q.get(timeout=timeout)
         except _queue.Empty:
-            raise TimeoutError(f"cTrader API call timed out after {timeout}s")
-        finally:
-            # Always wait before releasing the lock so the server can tear down
-            # the TCP session before the next connection attempt begins.
-            _t.sleep(_API_COOLDOWN_S)
+            timed_out = True
+            value = TimeoutError(f"cTrader API call timed out after {timeout}s")
+
+        if timed_out:
+            # The server still thinks we're connected — force-close the TCP socket
+            # so it releases the session before we attempt the next connection.
+            c = cleanup_client[0]
+            if c is not None:
+                reactor.callFromThread(lambda: _safe_stop(c))
+
+        # Wait for on_disconnected to confirm the TCP close, then buffer.
+        disconnect_event.wait(timeout=5.0)
+        _t.sleep(_API_COOLDOWN_S)
 
     if isinstance(value, Exception):
         raise value
