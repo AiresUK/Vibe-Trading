@@ -295,7 +295,7 @@ _RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadylogge
 # API call so only one TCP connection is ever open at once.
 _api_call_lock = threading.Lock()
 _API_COOLDOWN_S = 3.0  # extra buffer (seconds) after confirmed TCP disconnect before next connection
-_MAX_TIMEOUT_S = 12    # hard cap — overrides whatever is stored in ctrader.json
+_MAX_TIMEOUT_S = 30    # hard cap — overrides whatever is stored in ctrader.json
 
 
 def _execute(
@@ -630,7 +630,7 @@ def _get_auto_session(config: CTraderConfig) -> "CTraderSession":
             except Exception:
                 pass
         new_sess = CTraderSession(config)
-        new_sess.connect(timeout=15)
+        new_sess.connect(timeout=30)
         _auto_session = new_sess
         return new_sess
 
