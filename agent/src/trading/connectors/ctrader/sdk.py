@@ -310,13 +310,23 @@ def _execute(
     All subsequent calls in the same cycle reuse that connection — no
     reconnecting, no per-call rate-limiting, no ALREADYLOGGEDIN errors.
 
-    If the session dies mid-cycle ``_execute_retrying`` catches the error and
-    retries; ``_get_auto_session`` then creates a fresh connection.
+    On timeout the session is intentionally kept alive.  The Pepperstone demo
+    server sometimes responds 60-90 s after the request (large symbol list,
+    server load).  Keeping the TCP connection open means the delayed response
+    can satisfy the next retry on the same connection — no expensive
+    reconnection and no rate-limit cascade.
+
+    On hard disconnect / auth errors the session is invalidated so the next
+    call reconnects cleanly.
     """
     config = _maybe_refresh_token(config)
     try:
         sess = _get_auto_session(config)
         return sess.execute(make_request, timeout=timeout)
+    except TimeoutError:
+        # Do NOT invalidate on timeout — connection is still open.
+        # A delayed server response will be dropped harmlessly when it arrives.
+        raise
     except Exception:
         _invalidate_auto_session()
         raise
@@ -636,7 +646,7 @@ def _get_auto_session(config: CTraderConfig) -> "CTraderSession":
             # before we open a new one (avoids implicit rate-limiting on rapid reconnects).
             import time as _t; _t.sleep(3)
         new_sess = CTraderSession(config)
-        new_sess.connect(timeout=30)
+        new_sess.connect(timeout=60)
         _auto_session = new_sess
         return new_sess
 
