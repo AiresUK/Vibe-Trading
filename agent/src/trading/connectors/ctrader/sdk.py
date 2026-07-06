@@ -295,7 +295,7 @@ _RETRYABLE_PHRASES = ("disconnected before response", "timed out", "alreadylogge
 # API call so only one TCP connection is ever open at once.
 _api_call_lock = threading.Lock()
 _API_COOLDOWN_S = 3.0  # extra buffer (seconds) after confirmed TCP disconnect before next connection
-_MAX_TIMEOUT_S = 30    # hard cap — overrides whatever is stored in ctrader.json
+_MAX_TIMEOUT_S = 60    # default timeout — large enough for ProtoOASymbolsListRes on slow demo servers
 
 
 def _execute(
@@ -566,7 +566,10 @@ class CTraderSession:
             raise RuntimeError("cTrader session not connected")
         from twisted.internet import reactor as _reactor
 
-        t = min(timeout or self._config.timeout, _MAX_TIMEOUT_S)
+        # Use explicit timeout if given; otherwise use _MAX_TIMEOUT_S.
+        # Deliberately ignore self._config.timeout — ctrader.json may store an
+        # old low value (e.g. 30) that would cap even explicit large timeouts.
+        t = timeout if timeout is not None else _MAX_TIMEOUT_S
 
         with self._lock:
             rq: _queue.Queue = _queue.Queue()
@@ -629,6 +632,9 @@ def _get_auto_session(config: CTraderConfig) -> "CTraderSession":
                 sess.disconnect()
             except Exception:
                 pass
+            # Brief pause so the demo server can release the previous session
+            # before we open a new one (avoids implicit rate-limiting on rapid reconnects).
+            import time as _t; _t.sleep(3)
         new_sess = CTraderSession(config)
         new_sess.connect(timeout=30)
         _auto_session = new_sess
@@ -1028,8 +1034,35 @@ class _CancelOrderRequest(_RequestHandler):
 # Symbol cache (avoids repeated symbol list requests)
 # ---------------------------------------------------------------------------
 
-_symbol_cache: dict[str, dict[str, int]] = {}  # env → {name_upper: symbolId}
 _symbol_cache_lock = threading.Lock()
+
+
+def _load_symbol_cache_from_disk() -> "dict[str, dict[str, int]]":
+    """Load persisted symbol→id mappings from disk (survives process restarts)."""
+    path = get_runtime_root() / "ctrader_symbols.json"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            total = sum(len(v) for v in data.values())
+            logger.info("[ctrader] Loaded symbol cache from disk (%d symbols)", total)
+            return data
+        except Exception as exc:
+            logger.debug("[ctrader] Could not load symbol cache: %s", exc)
+    return {}
+
+
+def _save_symbol_cache_to_disk(cache: "dict[str, dict[str, int]]") -> None:
+    """Persist symbol cache to disk so future restarts skip the heavy list fetch."""
+    path = get_runtime_root() / "ctrader_symbols.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+        logger.debug("[ctrader] Symbol cache saved to %s", path)
+    except Exception as exc:
+        logger.debug("[ctrader] Could not save symbol cache: %s", exc)
+
+
+_symbol_cache: dict[str, dict[str, int]] = _load_symbol_cache_from_disk()  # env → {name_upper: symbolId}
 
 
 def _get_symbol_id(symbol: str, config: CTraderConfig) -> int:
@@ -1049,6 +1082,7 @@ def _get_symbol_id(symbol: str, config: CTraderConfig) -> int:
 
     with _symbol_cache_lock:
         _symbol_cache[key] = mapping
+        _save_symbol_cache_to_disk(_symbol_cache)
         if symbol_upper not in mapping:
             raise ValueError(
                 f"Symbol '{symbol}' not found on this cTrader account. "
