@@ -1075,6 +1075,9 @@ def _save_symbol_cache_to_disk(cache: "dict[str, dict[str, int]]") -> None:
 _symbol_cache: dict[str, dict[str, int]] = _load_symbol_cache_from_disk()  # env → {name_upper: symbolId}
 
 
+_SYMBOL_LIST_TIMEOUT_S = 180  # ProtoOASymbolsListRes can be slow on Pepperstone demo
+
+
 def _get_symbol_id(symbol: str, config: CTraderConfig) -> int:
     """Return the numeric symbolId for *symbol*, using a per-environment cache."""
     key = config.environment
@@ -1084,7 +1087,13 @@ def _get_symbol_id(symbol: str, config: CTraderConfig) -> int:
         if key in _symbol_cache and symbol_upper in _symbol_cache[key]:
             return _symbol_cache[key][symbol_upper]
 
-    res = _execute(config, _SymbolsRequest(config.account_id))
+    logger.warning(
+        "[ctrader] Symbol cache empty — fetching full symbol list "
+        "(may take up to %ds on Pepperstone demo). "
+        "Run agent/scripts/fetch_symbol_ids.py once to pre-populate the cache and avoid this delay.",
+        _SYMBOL_LIST_TIMEOUT_S,
+    )
+    res = _execute(config, _SymbolsRequest(config.account_id), timeout=_SYMBOL_LIST_TIMEOUT_S)
     mapping: dict[str, int] = {}
     for sym in res.symbol:
         name = sym.symbolName.strip().upper()
