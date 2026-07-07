@@ -23,6 +23,8 @@ _SDK_CONNECTOR_MODULES = {
     "dhan": "src.trading.connectors.dhan.sdk",
     "shoonya": "src.trading.connectors.shoonya.sdk",
     "trading212": "src.trading.connectors.trading212.sdk",
+    "mt5": "src.trading.connectors.mt5.sdk",
+    "ctrader": "src.trading.connectors.ctrader.sdk",
 }
 
 
@@ -216,12 +218,36 @@ def _order_classification(connector: str, symbol: str):
 
     Crypto connectors are unambiguous; multi-market equity connectors infer the
     asset class from the symbol's market tag (``.HK``/``HK.`` → HK, ``.US``/``US.``
-    → US, ``.SH``/``.SZ``/``CN.`` → A-share). When the market cannot be inferred
-    the asset class is ``None`` and the gate falls back to the US default — which
-    only ever DENIES (never silently widens) when the user's mandate permits a
-    non-US class, so the unknown case is fail-safe.
+    → US, ``.SH``/``.SZ``/``CN.`` → A-share). MT5 uses per-symbol classification.
+    When the market cannot be inferred the asset class is ``None`` and the gate
+    falls back to the US default — which only ever DENIES (never silently widens)
+    when the user's mandate permits a non-US class, so the unknown case is fail-safe.
     """
     from src.live.mandate.model import AssetClass, InstrumentType
+
+    # MT5 covers forex, indices, crypto, and commodities — classify per symbol.
+    if connector == "mt5":
+        from src.trading.connectors.mt5.classification import classify_symbol
+
+        instrument_name, asset_name = classify_symbol(symbol)
+        instrument = InstrumentType(instrument_name) if instrument_name in ("equity", "crypto") else InstrumentType("equity")
+        try:
+            asset = AssetClass(asset_name) if asset_name else None
+        except ValueError:
+            asset = None
+        return instrument, asset
+
+    # cTrader also covers forex, indices, crypto, and commodities.
+    if connector == "ctrader":
+        from src.trading.connectors.ctrader.classification import classify_symbol
+
+        instrument_name, asset_name = classify_symbol(symbol)
+        instrument = InstrumentType(instrument_name) if instrument_name in ("equity", "crypto") else InstrumentType("equity")
+        try:
+            asset = AssetClass(asset_name) if asset_name else None
+        except ValueError:
+            asset = None
+        return instrument, asset
 
     instrument_name, asset_name = _CONNECTOR_INSTRUMENT.get(connector, ("equity", None))
     instrument = InstrumentType(instrument_name)
@@ -248,6 +274,8 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -275,6 +303,8 @@ def place_order(
         "order_type": order_type,
         "limit_price": limit_price,
         "time_in_force": time_in_force,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
     }
 
     if profile.environment == "paper":
@@ -302,6 +332,29 @@ def place_order(
         session_id=session_id,
     )
     return _with_profile(profile, result)
+
+
+get_historical_bars = get_history
+
+
+def close_position(
+    position_id: int,
+    profile_id: str | None = None,
+    *,
+    volume: int,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Close an open position by position_id (cTrader and compatible connectors)."""
+    profile = profile_by_id(profile_id)
+    if profile.transport != "broker_sdk":
+        return _unsupported(profile, "positions.close")
+    if profile.readonly:
+        return _unsupported(profile, "positions.close")
+    module = _sdk_module(profile.connector)
+    if not hasattr(module, "close_position"):
+        return {"status": "unsupported", "error": f"{profile.connector} does not support close_position"}
+    config = module.build_config(profile.config, overrides)
+    return _with_profile(profile, module.close_position(config, position_id=position_id, volume=volume))
 
 
 def cancel_order(
